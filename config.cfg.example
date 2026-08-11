@@ -1,0 +1,13 @@
+[camera]
+ip = 192.168.0.100
+usuario = admin
+senha = SENHA_DA_CAMERA
+
+# opcionais
+porta = 554
+caminho = /cam/realmonitor?channel=1&subtype=0
+
+[web]
+titulo = Treinamento - BTS
+host = 0.0.0.0
+porta = 5011

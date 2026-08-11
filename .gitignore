@@ -1,0 +1,24 @@
+# Ambiente Python
+.venv/
+__pycache__/
+*.pyc
+
+# Pacotes baixados para instalacao offline (arquivos grandes, so uso local)
+pacotes_offline/
+*.rar
+*.zip
+
+# Configuracao real (tem senha da camera) - use config.cfg.example como modelo
+config.cfg
+
+# Ignora tudo dentro de projetos
+projetos/*
+!projetos/.gitkeep
+
+# Layout antigo (antes de suportar varios modelos) - caso ainda exista
+#dataset/
+#runs_treinamento/
+
+# Arquivos de sistema
+.DS_Store
+Thumbs.db
