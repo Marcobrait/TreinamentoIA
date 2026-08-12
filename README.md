@@ -18,7 +18,12 @@ cada um com suas próprias imagens, classes e histórico de treinamento.
    daquele modelo separado dos outros.
 2. **Capturar**: com a câmera ao vivo na tela, clique em "Capturar frame"
    quantas vezes quiser. Cada clique salva um frame nas imagens
-   pendentes **do modelo selecionado no momento**.
+   pendentes **do modelo selecionado no momento**. Alternativa: em vez
+   de capturar da câmera, use "Ou envie fotos prontas" (logo abaixo do
+   botão de captura) para subir fotos já existentes no computador
+   (`.jpg`/`.jpeg`/`.png`, pode selecionar várias de uma vez) — elas
+   entram na aba "Pendentes" junto com as capturadas, para anotar do
+   mesmo jeito.
 3. **Cadastrar classes**: dê nome às classes que esse modelo vai aprender
    a reconhecer. A ordem de cadastro define o índice da classe (a
    primeira é `0`, a segunda é `1`, etc.) — por isso não é possível
@@ -43,6 +48,27 @@ cada um com suas próprias imagens, classes e histórico de treinamento.
    `../runs/detect/train/weights/best.pt`, o que o `web_contador3.py`
    espera) e copia o `best.pt` treinado pra lá. É só reiniciar o
    programa que consome aquele modelo depois.
+
+## Testador IA
+
+No menu lateral, junto de "Treinamento", tem uma opção **"Testador IA"**
+para experimentar um modelo já treinado sem precisar aplicá-lo no
+`web_contador3.py` primeiro:
+
+- **Testar imagem**: escolha, na lista suspensa, qualquer modelo já
+  treinado (de qualquer um dos seus modelos/projetos, não só o
+  selecionado no topo da página), ajuste a confiança mínima se quiser, e
+  envie uma foto do computador. A página mostra a foto original ao lado
+  do resultado com as caixas e nomes das classes detectadas, e a lista
+  de detecções com o percentual de confiança de cada uma.
+- **Testar vídeo ao vivo (opcional)**: marque "Ativar teste de vídeo"
+  para abrir um formulário com os dados de conexão de uma câmera (IP,
+  usuário, senha, porta, caminho — pode ser a mesma câmera usada para
+  capturar imagens ou qualquer outra câmera RTSP). Escolha o modelo e
+  clique em "Conectar e testar": a página passa a mostrar o vídeo ao
+  vivo dessa câmera já com as detecções desenhadas em tempo real, sem
+  precisar reiniciar nada. Clique em "Parar teste" para encerrar e
+  liberar a câmera. Só é possível ter um teste de vídeo ativo por vez.
 
 ## Estrutura de pastas
 

@@ -3,6 +3,7 @@
 # python -m pip install --upgrade pip
 # python -m pip install -r requirements.txt
 
+import base64
 import configparser
 import shutil
 import threading
@@ -12,6 +13,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import cv2
+import numpy as np
 import torch
 import yaml
 from flask import Flask, Response, abort, jsonify, render_template_string, request, send_file
@@ -146,6 +148,21 @@ def load_rtsp_url(parser: configparser.ConfigParser) -> str:
     return f'rtsp://{usuario_escapado}:{senha_escapada}@{ip}:{porta}{caminho}'
 
 
+def build_rtsp_url(ip: str, usuario: str, senha: str, porta: str, caminho: str) -> str:
+    ip = (ip or '').strip()
+    usuario = (usuario or '').strip()
+    senha = (senha or '').strip()
+    if not ip or not usuario or not senha:
+        raise ValueError('Preencha ip, usuario e senha da camera.')
+    porta = (porta or '554').strip() or '554'
+    caminho = (caminho or '/cam/realmonitor?channel=1&subtype=0').strip()
+    if not caminho.startswith('/'):
+        caminho = '/' + caminho
+    usuario_escapado = quote(usuario, safe='%')
+    senha_escapada = quote(senha, safe='%')
+    return f'rtsp://{usuario_escapado}:{senha_escapada}@{ip}:{porta}{caminho}'
+
+
 class CameraStream:
     def __init__(self, rtsp_url: str) -> None:
         self.rtsp_url = rtsp_url
@@ -234,6 +251,115 @@ def descrever_dispositivo(trainer) -> str:
         return f'GPU ({torch.cuda.get_device_name(idx)})'
     except Exception:
         return f'GPU ({device_str})'
+
+
+def hex_to_bgr(hex_color: str):
+    hex_color = hex_color.lstrip('#')
+    r = int(hex_color[0:2], 16)
+    g = int(hex_color[2:4], 16)
+    b = int(hex_color[4:6], 16)
+    return (b, g, r)
+
+
+_modelo_cache = {}
+_modelo_cache_lock = threading.Lock()
+
+
+def carregar_modelo_cache(path: Path) -> YOLO:
+    chave = str(path.resolve())
+    with _modelo_cache_lock:
+        modelo = _modelo_cache.get(chave)
+        if modelo is None:
+            modelo = YOLO(chave)
+            _modelo_cache[chave] = modelo
+        return modelo
+
+
+def desenhar_deteccoes(frame, resultado) -> list:
+    deteccoes = []
+    nomes = resultado.names
+    for box in resultado.boxes:
+        cls_id = int(box.cls[0])
+        conf = float(box.conf[0])
+        x1, y1, x2, y2 = (int(v) for v in box.xyxy[0].tolist())
+        cor_hex = PALETTE[cls_id % len(PALETTE)]
+        cor_bgr = hex_to_bgr(cor_hex)
+        nome_classe = nomes.get(cls_id, str(cls_id))
+        cv2.rectangle(frame, (x1, y1), (x2, y2), cor_bgr, 2)
+        label = f'{nome_classe} {conf:.0%}'
+        (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(frame, (x1, max(0, y1 - lh - 8)), (x1 + lw + 6, y1), cor_bgr, -1)
+        cv2.putText(frame, label, (x1 + 3, max(12, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (11, 18, 32), 1, cv2.LINE_AA)
+        deteccoes.append({'classe': nome_classe, 'confianca': round(conf, 4), 'cor': cor_hex})
+    return deteccoes
+
+
+class TestVideoState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.stream = None
+        self.running = False
+        self.projeto = None
+        self.run = None
+        self.erro = None
+        self.last_jpeg = None
+
+    def start(self, stream, projeto: str, run: str) -> None:
+        with self.lock:
+            self.stream = stream
+            self.projeto = projeto
+            self.run = run
+            self.running = True
+            self.erro = None
+            self.last_jpeg = None
+
+    def set_frame(self, jpeg_bytes: bytes) -> None:
+        with self.lock:
+            self.last_jpeg = jpeg_bytes
+
+    def get_frame(self):
+        with self.lock:
+            return self.last_jpeg
+
+    def set_erro(self, msg: str) -> None:
+        with self.lock:
+            self.erro = msg
+            self.running = False
+
+    def stop(self) -> None:
+        with self.lock:
+            stream = self.stream
+            self.stream = None
+            self.running = False
+            self.last_jpeg = None
+        if stream is not None:
+            stream.stop()
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {'running': self.running, 'projeto': self.projeto, 'run': self.run, 'erro': self.erro}
+
+
+test_video_state = TestVideoState()
+
+
+def _loop_teste_video(stream: CameraStream, modelo: YOLO, conf: float) -> None:
+    try:
+        while test_video_state.running:
+            frame = stream.get_frame()
+            if frame is None:
+                time.sleep(0.05)
+                continue
+            resultado = modelo.predict(frame, conf=conf, verbose=False)[0]
+            desenhar_deteccoes(frame, resultado)
+            ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+            if ok:
+                test_video_state.set_frame(buf.tobytes())
+            time.sleep(0.03)
+    except Exception as exc:
+        test_video_state.set_erro(str(exc))
+    finally:
+        stream.stop()
 
 
 class TrainingState:
@@ -459,6 +585,19 @@ PAGE_HTML = """
       margin: 0; font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Arial, sans-serif;
       background: var(--bg); color: var(--text);
     }
+    .app-shell { display: flex; align-items: stretch; min-height: 100vh; }
+    .sidebar {
+      flex: 0 0 130px; width: 130px; background: var(--bg-elevated); border-right: 1px solid var(--border);
+      display: flex; flex-direction: column; gap: 4px; padding: 18px 10px;
+    }
+    .side-btn {
+      background: none; border: none; border-left: 3px solid transparent; color: var(--text-muted);
+      border-radius: 8px; padding: 10px 10px; text-align: left; cursor: pointer; font-size: 12.5px; font-weight: 600;
+    }
+    .side-btn:hover { color: var(--text); background: rgba(255,255,255,.05); }
+    .side-btn.active { color: var(--accent); background: rgba(59,130,246,.12); border-left-color: var(--accent); }
+    .app-main { flex: 1; min-width: 0; }
+
     header.topbar {
       display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 24px;
       background: var(--bg-elevated); border-bottom: 1px solid var(--border); flex-wrap: wrap;
@@ -474,6 +613,10 @@ PAGE_HTML = """
     }
 
     main.content { max-width: 1240px; margin: 0 auto; padding: 20px 24px 60px; display: flex; flex-direction: column; gap: 20px; }
+    .hr-soft { border: none; border-top: 1px solid var(--border); margin: 10px 0; width: 100%; }
+    .tester-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    @media (max-width: 720px) { .tester-grid { grid-template-columns: 1fr; } }
+    .tester-grid img { max-width: 100%; border-radius: 10px; background: #000; display: block; }
     .card {
       background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
       padding: 18px; box-shadow: var(--shadow);
@@ -612,6 +755,12 @@ PAGE_HTML = """
   </style>
 </head>
 <body>
+  <div class="app-shell">
+    <nav class="sidebar">
+      <button type="button" class="side-btn active" data-view="treinamento">Treinamento</button>
+      <button type="button" class="side-btn" data-view="testador">Testador IA</button>
+    </nav>
+    <div class="app-main">
   <header class="topbar">
     <div class="brand">
       <h1>Treinamento de Modelo</h1>
@@ -623,7 +772,7 @@ PAGE_HTML = """
     </div>
   </header>
 
-  <main class="content">
+  <main class="content" id="view-treinamento">
     <section class="card">
       <h2>Camera ao vivo</h2>
       <div class="video-row">
@@ -631,6 +780,12 @@ PAGE_HTML = """
         <div class="capture-panel">
           <button id="btn-capturar" class="btn-primary">Capturar frame</button>
           <div id="captura-resultado" class="hint"></div>
+          <hr class="hr-soft" />
+          <label class="field-label">Ou envie fotos prontas (em vez de capturar da camera)
+            <input type="file" id="input-upload-fotos" accept="image/jpeg,image/png" multiple />
+          </label>
+          <button id="btn-upload-fotos" class="btn-secondary">Enviar fotos</button>
+          <div id="upload-resultado" class="hint"></div>
         </div>
       </div>
     </section>
@@ -709,6 +864,70 @@ PAGE_HTML = """
     </section>
   </main>
 
+  <main class="content" id="view-testador" style="display:none;">
+    <section class="card">
+      <h2>Testador de IA - Imagem</h2>
+      <p class="hint">Escolha um modelo ja treinado (de qualquer um dos seus modelos/projetos), envie uma foto e veja o resultado da deteccao.</p>
+      <div class="training-form">
+        <label>Modelo treinado
+          <select id="test-sel-modelo" style="min-width:280px;"></select>
+        </label>
+        <label>Confianca minima
+          <input type="number" id="test-conf" value="0.4" min="0.05" max="0.95" step="0.05" style="min-width:90px;" />
+        </label>
+      </div>
+      <div class="capture-panel" style="margin-top:14px; max-width:320px;">
+        <input type="file" id="test-input-imagem" accept="image/jpeg,image/png" />
+        <button id="btn-testar-imagem" class="btn-primary">Testar imagem</button>
+        <div id="test-imagem-resultado" class="hint"></div>
+      </div>
+      <div class="tester-grid" style="margin-top:16px;">
+        <div>
+          <h3 style="font-size:11px; text-transform:uppercase; color:var(--text-muted); margin:0 0 6px;">Original</h3>
+          <img id="test-img-original" style="display:none;" />
+        </div>
+        <div>
+          <h3 style="font-size:11px; text-transform:uppercase; color:var(--text-muted); margin:0 0 6px;">Deteccoes</h3>
+          <img id="test-img-resultado" style="display:none;" />
+        </div>
+      </div>
+      <div id="test-deteccoes-lista" class="chip-list" style="margin-top:12px;"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <h2>Testador de IA - Video ao vivo (opcional)</h2>
+        <label class="hint" style="display:flex; align-items:center; gap:6px; cursor:pointer;">
+          <input type="checkbox" id="test-video-ativo" /> Ativar teste de video
+        </label>
+      </div>
+      <div id="test-video-config" style="display:none;">
+        <p class="hint">Informe os dados de conexao de uma camera (pode ser a mesma da captura ou outra qualquer) para testar o modelo ao vivo.</p>
+        <div class="training-form">
+          <label>IP <input type="text" id="test-cam-ip" placeholder="10.0.0.10" /></label>
+          <label>Usuario <input type="text" id="test-cam-usuario" placeholder="admin" /></label>
+          <label>Senha <input type="password" id="test-cam-senha" /></label>
+          <label>Porta <input type="text" id="test-cam-porta" value="554" style="min-width:70px;" /></label>
+          <label>Caminho <input type="text" id="test-cam-caminho" placeholder="/cam/realmonitor?channel=1&amp;subtype=0" style="min-width:260px;" /></label>
+          <label>Modelo
+            <select id="test-video-sel-modelo" style="min-width:220px;"></select>
+          </label>
+          <label>Confianca
+            <input type="number" id="test-video-conf" value="0.4" min="0.05" max="0.95" step="0.05" style="min-width:90px;" />
+          </label>
+          <button id="btn-video-conectar" class="btn-primary">Conectar e testar</button>
+        </div>
+        <div id="test-video-resultado" class="hint" style="margin-top:8px;"></div>
+        <div id="test-video-wrap" style="display:none; margin-top:14px;">
+          <img id="test-video-img" style="max-width:640px; width:100%; border-radius:10px; background:#000; display:block;" />
+          <button id="btn-video-parar" class="btn-secondary" style="margin-top:10px;">Parar teste</button>
+        </div>
+      </div>
+    </section>
+  </main>
+    </div>
+  </div>
+
   <div id="modal-anotacao" class="modal">
     <div class="modal-box">
       <div class="modal-header">
@@ -762,6 +981,17 @@ PAGE_HTML = """
     const state = { classes: [], activeClassIndex: 0, currentImage: null, boxes: [], drawing: false };
     let abaAtiva = 'pendentes';
     let projetoAtual = localStorage.getItem('treinamento_projeto_atual') || '';
+
+    document.querySelectorAll('.side-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.side-btn').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        const view = btn.getAttribute('data-view');
+        document.getElementById('view-treinamento').style.display = view === 'treinamento' ? 'flex' : 'none';
+        document.getElementById('view-testador').style.display = view === 'testador' ? 'flex' : 'none';
+        if (view === 'testador') carregarModelosTestador();
+      });
+    });
 
     function qp(extra) {
       const params = new URLSearchParams(Object.assign({ projeto: projetoAtual }, extra || {}));
@@ -910,6 +1140,34 @@ PAGE_HTML = """
           carregarImagens();
         } else {
           resultEl.textContent = data.erro || 'Falha ao capturar.';
+          resultEl.className = 'hint err';
+        }
+      } catch (_) {
+        resultEl.textContent = 'Falha ao contatar o servidor.';
+        resultEl.className = 'hint err';
+      }
+    });
+
+    document.getElementById('btn-upload-fotos').addEventListener('click', async () => {
+      if (!projetoAtual) { alert('Crie um modelo primeiro.'); return; }
+      const input = document.getElementById('input-upload-fotos');
+      const resultEl = document.getElementById('upload-resultado');
+      if (!input.files.length) { resultEl.textContent = 'Escolha ao menos uma foto.'; resultEl.className = 'hint err'; return; }
+      const fd = new FormData();
+      fd.append('projeto', projetoAtual);
+      for (const arquivo of input.files) fd.append('arquivos', arquivo);
+      resultEl.textContent = 'Enviando...';
+      resultEl.className = 'hint';
+      try {
+        const res = await fetch('/imagens/upload', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (data.ok) {
+          resultEl.textContent = `${data.salvos} foto(s) enviada(s) para "Pendentes".`;
+          resultEl.className = 'hint ok';
+          input.value = '';
+          carregarImagens();
+        } else {
+          resultEl.textContent = data.erro || 'Falha ao enviar.';
           resultEl.className = 'hint err';
         }
       } catch (_) {
@@ -1219,8 +1477,114 @@ PAGE_HTML = """
       });
     }
 
+    async function carregarModelosTestador() {
+      const res = await fetch('/testador/modelos');
+      const lista = await res.json();
+      const optionsHtml = lista.length
+        ? lista.map((m) => `<option value="${m.projeto}|${m.run}">${m.projeto} - ${m.run} (${m.modificado})</option>`).join('')
+        : '<option value="">Nenhum modelo treinado ainda</option>';
+      document.getElementById('test-sel-modelo').innerHTML = optionsHtml;
+      document.getElementById('test-video-sel-modelo').innerHTML = optionsHtml;
+    }
+
+    document.getElementById('btn-testar-imagem').addEventListener('click', async () => {
+      const sel = document.getElementById('test-sel-modelo').value;
+      const resultEl = document.getElementById('test-imagem-resultado');
+      const input = document.getElementById('test-input-imagem');
+      if (!sel) { resultEl.textContent = 'Nenhum modelo treinado disponivel.'; resultEl.className = 'hint err'; return; }
+      if (!input.files.length) { resultEl.textContent = 'Escolha uma imagem.'; resultEl.className = 'hint err'; return; }
+      const [projeto, run] = sel.split('|');
+
+      const origPreview = document.getElementById('test-img-original');
+      origPreview.src = URL.createObjectURL(input.files[0]);
+      origPreview.style.display = 'block';
+
+      const fd = new FormData();
+      fd.append('projeto', projeto);
+      fd.append('run', run);
+      fd.append('conf', document.getElementById('test-conf').value);
+      fd.append('imagem', input.files[0]);
+
+      resultEl.textContent = 'Analisando...';
+      resultEl.className = 'hint';
+      try {
+        const res = await fetch('/testador/imagem', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (data.ok) {
+          const resImg = document.getElementById('test-img-resultado');
+          resImg.src = `data:image/jpeg;base64,${data.imagem}`;
+          resImg.style.display = 'block';
+          resultEl.textContent = data.deteccoes.length ? `${data.deteccoes.length} deteccao(oes) encontrada(s).` : 'Nenhuma deteccao encontrada.';
+          resultEl.className = 'hint ok';
+          document.getElementById('test-deteccoes-lista').innerHTML = data.deteccoes.map((d) => `
+            <span class="chip-select" style="--chip-color:${d.cor}">${d.classe} (${Math.round(d.confianca * 100)}%)</span>
+          `).join('');
+        } else {
+          resultEl.textContent = data.erro || 'Falha ao testar imagem.';
+          resultEl.className = 'hint err';
+        }
+      } catch (_) {
+        resultEl.textContent = 'Falha ao contatar o servidor.';
+        resultEl.className = 'hint err';
+      }
+    });
+
+    document.getElementById('test-video-ativo').addEventListener('change', (ev) => {
+      document.getElementById('test-video-config').style.display = ev.target.checked ? 'block' : 'none';
+    });
+
+    document.getElementById('btn-video-conectar').addEventListener('click', async () => {
+      const sel = document.getElementById('test-video-sel-modelo').value;
+      const resultEl = document.getElementById('test-video-resultado');
+      if (!sel) { resultEl.textContent = 'Nenhum modelo treinado disponivel.'; resultEl.className = 'hint err'; return; }
+      const [projeto, run] = sel.split('|');
+      const body = {
+        ip: document.getElementById('test-cam-ip').value,
+        usuario: document.getElementById('test-cam-usuario').value,
+        senha: document.getElementById('test-cam-senha').value,
+        porta: document.getElementById('test-cam-porta').value,
+        caminho: document.getElementById('test-cam-caminho').value,
+        projeto, run,
+        conf: document.getElementById('test-video-conf').value,
+      };
+      const btn = document.getElementById('btn-video-conectar');
+      btn.disabled = true;
+      resultEl.textContent = 'Conectando na camera...';
+      resultEl.className = 'hint';
+      try {
+        const res = await fetch('/testador/video/iniciar', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          resultEl.textContent = 'Conectado! Exibindo video com as deteccoes ao vivo.';
+          resultEl.className = 'hint ok';
+          document.getElementById('test-video-wrap').style.display = 'block';
+          document.getElementById('test-video-img').src = `/testador/video_feed?t=${Date.now()}`;
+        } else {
+          resultEl.textContent = data.erro || 'Falha ao conectar na camera.';
+          resultEl.className = 'hint err';
+        }
+      } catch (_) {
+        resultEl.textContent = 'Falha ao contatar o servidor.';
+        resultEl.className = 'hint err';
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    document.getElementById('btn-video-parar').addEventListener('click', async () => {
+      await fetch('/testador/video/parar', { method: 'POST' });
+      document.getElementById('test-video-wrap').style.display = 'none';
+      document.getElementById('test-video-img').src = '';
+      const resultEl = document.getElementById('test-video-resultado');
+      resultEl.textContent = 'Teste de video parado.';
+      resultEl.className = 'hint';
+    });
+
     carregarAmbiente();
     carregarProjetos();
+    carregarModelosTestador();
   </script>
 </body>
 </html>
@@ -1281,6 +1645,26 @@ def create_app(stream: CameraStream, titulo: str) -> Flask:
         if not cv2.imwrite(str(destino), frame):
             return jsonify({'ok': False, 'erro': 'Falha ao salvar a imagem.'}), 500
         return jsonify({'ok': True, 'arquivo': nome})
+
+    @app.post('/imagens/upload')
+    def upload_imagens():
+        pp = get_project(request.form.get('projeto', ''))
+        arquivos = request.files.getlist('arquivos')
+        if not arquivos:
+            return jsonify({'ok': False, 'erro': 'Nenhum arquivo enviado.'}), 400
+        salvos = 0
+        for i, arquivo in enumerate(arquivos):
+            if not arquivo or not arquivo.filename:
+                continue
+            ext = Path(arquivo.filename).suffix.lower()
+            if ext not in ('.jpg', '.jpeg', '.png'):
+                continue
+            nome = f"upload_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{i}{ext}"
+            arquivo.save(str(pp.capturas / nome))
+            salvos += 1
+        if not salvos:
+            return jsonify({'ok': False, 'erro': 'Nenhuma imagem valida enviada (use .jpg/.jpeg/.png).'}), 400
+        return jsonify({'ok': True, 'salvos': salvos})
 
     def _listar(pasta_dir: Path, label_dir=None):
         itens = []
@@ -1530,6 +1914,126 @@ def create_app(stream: CameraStream, titulo: str) -> Flask:
         destino.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(best, destino)
         return jsonify({'ok': True, 'destino': str(destino)})
+
+    @app.get('/testador/modelos')
+    def testador_modelos():
+        resultado = []
+        for nome in list_projetos():
+            pp = get_project(nome)
+            if not pp.runs.exists():
+                continue
+            for d in sorted((p for p in pp.runs.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime, reverse=True):
+                if (d / 'weights' / 'best.pt').exists():
+                    resultado.append({
+                        'projeto': nome,
+                        'run': d.name,
+                        'modificado': datetime.fromtimestamp(d.stat().st_mtime).strftime('%d/%m/%Y %H:%M'),
+                        '_mtime': d.stat().st_mtime,
+                    })
+        resultado.sort(key=lambda r: r['_mtime'], reverse=True)
+        for r in resultado:
+            del r['_mtime']
+        return jsonify(resultado)
+
+    @app.post('/testador/imagem')
+    def testador_imagem():
+        pp = get_project(request.form.get('projeto', ''))
+        run = safe_name(request.form.get('run', ''))
+        best = pp.runs / run / 'weights' / 'best.pt'
+        if not best.exists():
+            return jsonify({'ok': False, 'erro': 'Modelo nao encontrado.'}), 404
+
+        arquivo = request.files.get('imagem')
+        if not arquivo or not arquivo.filename:
+            return jsonify({'ok': False, 'erro': 'Nenhuma imagem enviada.'}), 400
+
+        try:
+            conf = float(request.form.get('conf', 0.4))
+        except (TypeError, ValueError):
+            conf = 0.4
+        conf = min(max(conf, 0.05), 0.95)
+
+        dados = arquivo.read()
+        arr = np.frombuffer(dados, dtype=np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            return jsonify({'ok': False, 'erro': 'Nao foi possivel ler a imagem enviada.'}), 400
+
+        try:
+            modelo = carregar_modelo_cache(best)
+            resultado = modelo.predict(frame, conf=conf, verbose=False)[0]
+        except Exception as exc:
+            return jsonify({'ok': False, 'erro': f'Falha ao rodar o modelo: {exc}'}), 500
+        deteccoes = desenhar_deteccoes(frame, resultado)
+
+        ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        if not ok:
+            return jsonify({'ok': False, 'erro': 'Falha ao codificar imagem de resultado.'}), 500
+        imagem_b64 = base64.b64encode(buf.tobytes()).decode('ascii')
+        return jsonify({'ok': True, 'imagem': imagem_b64, 'deteccoes': deteccoes})
+
+    @app.post('/testador/video/iniciar')
+    def testador_video_iniciar():
+        if test_video_state.running:
+            return jsonify({'ok': False, 'erro': 'Ja ha um teste de video em andamento. Pare antes de iniciar outro.'}), 409
+
+        data = request.get_json(silent=True) or {}
+        try:
+            rtsp_url = build_rtsp_url(
+                data.get('ip', ''), data.get('usuario', ''), data.get('senha', ''),
+                data.get('porta', '554'), data.get('caminho', ''),
+            )
+        except ValueError as exc:
+            return jsonify({'ok': False, 'erro': str(exc)}), 400
+
+        pp = get_project(str(data.get('projeto', '')))
+        run = safe_name(str(data.get('run', '')))
+        best = pp.runs / run / 'weights' / 'best.pt'
+        if not best.exists():
+            return jsonify({'ok': False, 'erro': 'Modelo nao encontrado.'}), 404
+
+        try:
+            conf = float(data.get('conf', 0.4))
+        except (TypeError, ValueError):
+            conf = 0.4
+        conf = min(max(conf, 0.05), 0.95)
+
+        stream_teste = CameraStream(rtsp_url)
+        if not stream_teste.is_opened():
+            stream_teste.cap.release()
+            return jsonify({'ok': False, 'erro': 'Nao foi possivel conectar na camera. Confira os dados.'}), 400
+
+        try:
+            modelo = carregar_modelo_cache(best)
+        except Exception as exc:
+            stream_teste.cap.release()
+            return jsonify({'ok': False, 'erro': f'Falha ao carregar o modelo: {exc}'}), 500
+
+        stream_teste.start()
+        test_video_state.start(stream_teste, pp.nome, run)
+        threading.Thread(target=_loop_teste_video, args=(stream_teste, modelo, conf), daemon=True).start()
+        return jsonify({'ok': True})
+
+    @app.post('/testador/video/parar')
+    def testador_video_parar():
+        test_video_state.stop()
+        return jsonify({'ok': True})
+
+    @app.get('/testador/video/status')
+    def testador_video_status():
+        return jsonify(test_video_state.snapshot())
+
+    @app.get('/testador/video_feed')
+    def testador_video_feed():
+        def generate():
+            while test_video_state.running:
+                jpeg = test_video_state.get_frame()
+                if jpeg is None:
+                    time.sleep(0.05)
+                    continue
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpeg + b'\r\n')
+                time.sleep(0.03)
+        return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
     return app
 
