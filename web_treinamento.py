@@ -734,7 +734,10 @@ PAGE_HTML = """
     }
     .modal-body { display: flex; gap: 18px; padding: 18px; flex-wrap: wrap; }
     .canvas-wrap { flex: 1 1 480px; }
-    #anotacao-canvas { max-width: 100%; border-radius: 8px; background: #000; cursor: crosshair; }
+    .canvas-nav-row { display: flex; align-items: center; gap: 10px; }
+    .nav-arrow { flex: 0 0 auto; width: 34px; height: 34px; font-size: 20px; }
+    .nav-arrow:disabled { opacity: .3; cursor: not-allowed; }
+    #anotacao-canvas { flex: 1 1 auto; min-width: 0; max-width: 100%; border-radius: 8px; background: #000; cursor: crosshair; }
     .modal-side { flex: 0 0 260px; display: flex; flex-direction: column; gap: 6px; }
     .modal-side h3 { font-size: 11px; text-transform: uppercase; color: var(--text-muted); margin: 10px 0 4px; }
     .boxes-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
@@ -931,12 +934,19 @@ PAGE_HTML = """
   <div id="modal-anotacao" class="modal">
     <div class="modal-box">
       <div class="modal-header">
-        <strong id="modal-titulo">Anotar imagem</strong>
+        <div style="display:flex; align-items:baseline; gap:10px;">
+          <strong id="modal-titulo">Anotar imagem</strong>
+          <span id="modal-posicao" class="hint"></span>
+        </div>
         <button id="modal-fechar" class="icon-btn">&times;</button>
       </div>
       <div class="modal-body">
         <div class="canvas-wrap">
-          <canvas id="anotacao-canvas"></canvas>
+          <div class="canvas-nav-row">
+            <button type="button" id="btn-anotacao-anterior" class="icon-btn nav-arrow" title="Foto anterior">&lsaquo;</button>
+            <canvas id="anotacao-canvas"></canvas>
+            <button type="button" id="btn-anotacao-proxima" class="icon-btn nav-arrow" title="Proxima foto">&rsaquo;</button>
+          </div>
         </div>
         <div class="modal-side">
           <h3>Classe ativa (usada ao desenhar)</h3>
@@ -1176,6 +1186,8 @@ PAGE_HTML = """
       }
     });
 
+    let galeriaItens = [];
+
     async function carregarImagens() {
       if (!projetoAtual) return;
       const res = await fetch(`/imagens?${qp()}`);
@@ -1183,7 +1195,8 @@ PAGE_HTML = """
       document.getElementById('count-pendentes').textContent = data.pendentes.length;
       document.getElementById('count-treino').textContent = data.treino.length;
       document.getElementById('count-validacao').textContent = data.validacao.length;
-      renderGaleria(data[abaAtiva] || []);
+      galeriaItens = data[abaAtiva] || [];
+      renderGaleria(galeriaItens);
     }
 
     function renderGaleria(itens) {
@@ -1252,6 +1265,7 @@ PAGE_HTML = """
       document.getElementById('anotacao-resultado').textContent = '';
       renderClassChips();
       renderListaCaixas();
+      atualizarNavegacaoAnotacao();
 
       if (pasta !== 'pendentes') {
         try {
@@ -1266,7 +1280,7 @@ PAGE_HTML = """
       const img = new Image();
       img.onload = () => {
         imagemCarregada = img;
-        const maxW = Math.min(760, window.innerWidth - 340);
+        const maxW = Math.min(760, window.innerWidth - 430);
         const scale = Math.min(1, maxW / img.naturalWidth);
         canvas.width = Math.round(img.naturalWidth * scale);
         canvas.height = Math.round(img.naturalHeight * scale);
@@ -1276,6 +1290,34 @@ PAGE_HTML = """
 
       modal.style.display = 'flex';
     }
+
+    function atualizarNavegacaoAnotacao() {
+      const btnAnt = document.getElementById('btn-anotacao-anterior');
+      const btnProx = document.getElementById('btn-anotacao-proxima');
+      const posEl = document.getElementById('modal-posicao');
+      const idx = galeriaItens.findIndex((it) => it.nome === state.currentImage.nome);
+      if (idx === -1) {
+        btnAnt.disabled = true;
+        btnProx.disabled = true;
+        posEl.textContent = '';
+        return;
+      }
+      btnAnt.disabled = idx <= 0;
+      btnProx.disabled = idx >= galeriaItens.length - 1;
+      posEl.textContent = `${idx + 1} de ${galeriaItens.length}`;
+    }
+
+    function navegarAnotacao(direcao) {
+      if (!state.currentImage) return;
+      const idx = galeriaItens.findIndex((it) => it.nome === state.currentImage.nome);
+      if (idx === -1) return;
+      const novoIdx = idx + direcao;
+      if (novoIdx < 0 || novoIdx >= galeriaItens.length) return;
+      abrirAnotacao(state.currentImage.pasta, galeriaItens[novoIdx].nome);
+    }
+
+    document.getElementById('btn-anotacao-anterior').addEventListener('click', () => navegarAnotacao(-1));
+    document.getElementById('btn-anotacao-proxima').addEventListener('click', () => navegarAnotacao(1));
 
     document.getElementById('modal-fechar').addEventListener('click', () => { modal.style.display = 'none'; });
 
