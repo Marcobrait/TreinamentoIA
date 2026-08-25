@@ -60,6 +60,7 @@ class ProjectPaths:
         self.labels_train = self.dataset / 'labels' / 'train'
         self.labels_val = self.dataset / 'labels' / 'val'
         self.classes_file = self.dataset / 'classes.txt'
+        self.task_file = self.dataset / 'task.txt'
         self.runs = self.root / 'runs_treinamento'
 
     def ensure(self) -> None:
@@ -70,6 +71,18 @@ class ProjectPaths:
 
     def exists(self) -> bool:
         return self.root.exists()
+
+
+def load_project_task(pp: ProjectPaths) -> str:
+    if pp.task_file.exists():
+        conteudo = pp.task_file.read_text(encoding='utf-8').strip()
+        if conteudo == 'segment':
+            return 'segment'
+    return 'detect'
+
+
+def save_project_task(pp: ProjectPaths, task: str) -> None:
+    pp.task_file.write_text(task, encoding='utf-8')
 
 
 def list_projetos() -> list:
@@ -85,14 +98,17 @@ def get_project(nome: str) -> ProjectPaths:
     return pp
 
 
-def create_project(nome: str, classes_iniciais=None) -> ProjectPaths:
+def create_project(nome: str, classes_iniciais=None, task: str = 'detect') -> ProjectPaths:
     slug = slugify_projeto(nome)
     if not slug:
         raise ValueError('Nome do modelo nao pode ser vazio.')
+    if task not in ('detect', 'segment'):
+        raise ValueError('Tipo de treinamento invalido.')
     pp = ProjectPaths(slug)
     if pp.root.exists():
         raise ValueError('Ja existe um modelo com esse nome.')
     pp.ensure()
+    save_project_task(pp, task)
     classes_iniciais = [c.strip() for c in (classes_iniciais or []) if c.strip()]
     if classes_iniciais:
         save_classes(pp, classes_iniciais)
@@ -278,14 +294,19 @@ def carregar_modelo_cache(path: Path) -> YOLO:
 def desenhar_deteccoes(frame, resultado) -> list:
     deteccoes = []
     nomes = resultado.names
-    for box in resultado.boxes:
+    masks_xy = resultado.masks.xy if resultado.masks is not None else None
+    for i, box in enumerate(resultado.boxes):
         cls_id = int(box.cls[0])
         conf = float(box.conf[0])
         x1, y1, x2, y2 = (int(v) for v in box.xyxy[0].tolist())
         cor_hex = PALETTE[cls_id % len(PALETTE)]
         cor_bgr = hex_to_bgr(cor_hex)
         nome_classe = nomes.get(cls_id, str(cls_id))
-        cv2.rectangle(frame, (x1, y1), (x2, y2), cor_bgr, 2)
+        if masks_xy is not None and i < len(masks_xy):
+            pontos = masks_xy[i].astype(np.int32)
+            cv2.polylines(frame, [pontos], True, cor_bgr, 2)
+        else:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), cor_bgr, 2)
         label = f'{nome_classe} {conf:.0%}'
         (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         cv2.rectangle(frame, (x1, max(0, y1 - lh - 8)), (x1 + lw + 6, y1), cor_bgr, -1)
@@ -480,7 +501,11 @@ def _resolve_base_model(pp: ProjectPaths, modelo_base: str) -> str:
             raise ValueError('Nenhum treinamento anterior encontrado para continuar neste modelo.')
         return str(candidatos[0] / 'weights' / 'last.pt')
 
-    permitidos = {'yolov8n.pt', 'yolov8s.pt', 'yolov8m.pt'}
+    task = load_project_task(pp)
+    if task == 'segment':
+        permitidos = {'yolov8n-seg.pt', 'yolov8s-seg.pt', 'yolov8m-seg.pt'}
+    else:
+        permitidos = {'yolov8n.pt', 'yolov8s.pt', 'yolov8m.pt'}
     if modelo_base not in permitidos:
         raise ValueError('Modelo base invalido.')
     if modelo_base == 'yolov8n.pt' and LOCAL_BASE_MODEL.exists():
@@ -951,6 +976,11 @@ PAGE_HTML = """
         <div class="modal-side">
           <h3>Classe ativa (usada ao desenhar)</h3>
           <div id="modal-classes" class="chip-list"></div>
+          <div id="modo-anotacao-row" class="radio-row" style="display:none;">
+            <label><input type="radio" name="modo-anotacao" value="rect" checked /> Retangulo</label>
+            <label><input type="radio" name="modo-anotacao" value="poligono" /> Poligono</label>
+          </div>
+          <p id="modo-anotacao-hint" class="hint" style="display:none;">Clique nos vertices do objeto e feche clicando de novo no ponto inicial (min. 3 pontos). Esc cancela.</p>
           <h3>Caixas desenhadas</h3>
           <ul id="lista-caixas" class="boxes-list"><li class="hint">Nenhuma caixa desenhada.</li></ul>
           <h3>Salvar como</h3>
@@ -980,6 +1010,11 @@ PAGE_HTML = """
         <label class="field-label" style="margin-top: 10px;">Classes iniciais (opcional, separadas por virgula)
           <input type="text" id="novo-projeto-classes" placeholder="Ex: PULL, ESTANTE" autocomplete="off" />
         </label>
+        <label class="field-label" style="margin-top: 10px;">Tipo de treinamento</label>
+        <div class="radio-row">
+          <label><input type="radio" name="novo-projeto-tipo" value="detect" checked /> Deteccao (caixa)</label>
+          <label><input type="radio" name="novo-projeto-tipo" value="segment" /> Segmentacao (contorno preciso)</label>
+        </div>
         <button id="btn-criar-projeto" class="btn-primary" style="margin-top: 14px;">Criar modelo</button>
         <div id="novo-projeto-resultado" class="hint"></div>
       </div>
@@ -988,9 +1023,11 @@ PAGE_HTML = """
 
   <script>
     const PALETTE = ['#22c55e', '#f59e0b', '#3b82f6', '#ef4444', '#a855f7', '#14b8a6', '#eab308', '#ec4899'];
-    const state = { classes: [], activeClassIndex: 0, currentImage: null, boxes: [], drawing: false };
+    const state = { classes: [], activeClassIndex: 0, currentImage: null, boxes: [], drawing: false, mode: 'rect', polyPoints: [] };
     let abaAtiva = 'pendentes';
     let projetoAtual = localStorage.getItem('treinamento_projeto_atual') || '';
+    let projetoTask = 'detect';
+    let modoAnotacaoPreferido = localStorage.getItem('treinamento_modo_anotacao') || 'rect';
 
     document.querySelectorAll('.side-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
@@ -1068,6 +1105,7 @@ PAGE_HTML = """
       document.getElementById('novo-projeto-nome').value = '';
       document.getElementById('novo-projeto-classes').value = '';
       document.getElementById('novo-projeto-resultado').textContent = '';
+      document.querySelector('input[name="novo-projeto-tipo"][value="detect"]').checked = true;
       modalNovoProjeto.style.display = 'flex';
     });
     document.getElementById('modal-novo-projeto-fechar').addEventListener('click', () => { modalNovoProjeto.style.display = 'none'; });
@@ -1078,9 +1116,10 @@ PAGE_HTML = """
       const resultEl = document.getElementById('novo-projeto-resultado');
       if (!nome) { resultEl.textContent = 'Digite um nome.'; resultEl.className = 'hint err'; return; }
       const classes_iniciais = classesRaw ? classesRaw.split(',').map((c) => c.trim()).filter(Boolean) : [];
+      const tipo = document.querySelector('input[name="novo-projeto-tipo"]:checked').value;
       const res = await fetch('/projetos', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ nome, classes_iniciais }),
+        body: JSON.stringify({ nome, classes_iniciais, tipo }),
       });
       const data = await res.json();
       if (data.ok) {
@@ -1195,8 +1234,29 @@ PAGE_HTML = """
       document.getElementById('count-pendentes').textContent = data.pendentes.length;
       document.getElementById('count-treino').textContent = data.treino.length;
       document.getElementById('count-validacao').textContent = data.validacao.length;
+      projetoTask = data.task || 'detect';
+      atualizarSeletorModeloBase();
       galeriaItens = data[abaAtiva] || [];
       renderGaleria(galeriaItens);
+    }
+
+    function atualizarSeletorModeloBase() {
+      const sel = document.getElementById('cfg-modelo');
+      const valorAtual = sel.value;
+      const opcoes = projetoTask === 'segment'
+        ? [
+            ['yolov8n-seg.pt', 'YOLOv8n-seg (rapido, leve, precisa internet)'],
+            ['yolov8s-seg.pt', 'YOLOv8s-seg (equilibrado, precisa internet)'],
+            ['yolov8m-seg.pt', 'YOLOv8m-seg (mais preciso, precisa internet)'],
+          ]
+        : [
+            ['yolov8n.pt', 'YOLOv8n (rapido, leve)'],
+            ['yolov8s.pt', 'YOLOv8s (equilibrado, precisa internet)'],
+            ['yolov8m.pt', 'YOLOv8m (mais preciso, precisa internet)'],
+          ];
+      sel.innerHTML = opcoes.map(([v, label]) => `<option value="${v}">${label}</option>`).join('')
+        + '<option value="__ultimo__">Continuar do ultimo treinamento deste modelo</option>';
+      if (opcoes.some(([v]) => v === valorAtual) || valorAtual === '__ultimo__') sel.value = valorAtual;
     }
 
     function renderGaleria(itens) {
@@ -1261,8 +1321,16 @@ PAGE_HTML = """
     async function abrirAnotacao(pasta, nome) {
       state.currentImage = { pasta, nome };
       state.boxes = [];
+      state.polyPoints = [];
       document.getElementById('modal-titulo').textContent = `Anotar: ${nome}`;
       document.getElementById('anotacao-resultado').textContent = '';
+      const modoRow = document.getElementById('modo-anotacao-row');
+      const modoHint = document.getElementById('modo-anotacao-hint');
+      const mostrarModo = projetoTask === 'segment';
+      modoRow.style.display = mostrarModo ? 'flex' : 'none';
+      modoHint.style.display = mostrarModo ? 'block' : 'none';
+      state.mode = mostrarModo ? modoAnotacaoPreferido : 'rect';
+      document.querySelector(`input[name="modo-anotacao"][value="${state.mode}"]`).checked = true;
       renderClassChips();
       renderListaCaixas();
       atualizarNavegacaoAnotacao();
@@ -1321,16 +1389,32 @@ PAGE_HTML = """
 
     document.getElementById('modal-fechar').addEventListener('click', () => { modal.style.display = 'none'; });
 
+    function desenharPoligono(pontosCanvas, cor, fechado) {
+      ctx.strokeStyle = cor; ctx.lineWidth = 2;
+      ctx.beginPath();
+      pontosCanvas.forEach(([x, y], i) => { if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y); });
+      if (fechado) ctx.closePath();
+      ctx.stroke();
+    }
+
     function desenharCanvas() {
       if (!imagemCarregada) return;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(imagemCarregada, 0, 0, canvas.width, canvas.height);
       state.boxes.forEach((box) => {
         const cor = PALETTE[box.classe % PALETTE.length];
-        const x = box.x * canvas.width, y = box.y * canvas.height;
-        const w = box.w * canvas.width, h = box.h * canvas.height;
-        ctx.strokeStyle = cor; ctx.lineWidth = 2;
-        ctx.strokeRect(x, y, w, h);
+        let x, y;
+        if (box.pontos) {
+          const pontosCanvas = box.pontos.map(([px, py]) => [px * canvas.width, py * canvas.height]);
+          desenharPoligono(pontosCanvas, cor, true);
+          x = Math.min(...pontosCanvas.map((p) => p[0]));
+          y = Math.min(...pontosCanvas.map((p) => p[1]));
+        } else {
+          x = box.x * canvas.width; y = box.y * canvas.height;
+          const w = box.w * canvas.width, h = box.h * canvas.height;
+          ctx.strokeStyle = cor; ctx.lineWidth = 2;
+          ctx.strokeRect(x, y, w, h);
+        }
         const nomeClasse = state.classes[box.classe] || '?';
         ctx.font = '11px sans-serif';
         const labelW = ctx.measureText(nomeClasse).width + 8;
@@ -1339,15 +1423,35 @@ PAGE_HTML = """
         ctx.fillStyle = '#0b1220';
         ctx.fillText(nomeClasse, x + 4, Math.max(11, y - 4));
       });
-      if (state.drawing) {
+      if (state.mode === 'rect' && state.drawing) {
         ctx.strokeStyle = PALETTE[state.activeClassIndex % PALETTE.length];
         ctx.setLineDash([4, 3]);
         ctx.strokeRect(state.drawX, state.drawY, state.drawW, state.drawH);
         ctx.setLineDash([]);
       }
+      if (state.mode === 'poligono' && state.polyPoints.length) {
+        const cor = PALETTE[state.activeClassIndex % PALETTE.length];
+        desenharPoligono(state.polyPoints, cor, false);
+        if (state.mouseX !== undefined) {
+          ctx.strokeStyle = cor;
+          ctx.setLineDash([4, 3]);
+          ctx.beginPath();
+          const [lx, ly] = state.polyPoints[state.polyPoints.length - 1];
+          ctx.moveTo(lx, ly);
+          ctx.lineTo(state.mouseX, state.mouseY);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+        const [fx, fy] = state.polyPoints[0];
+        ctx.beginPath();
+        ctx.arc(fx, fy, 5, 0, Math.PI * 2);
+        ctx.fillStyle = cor;
+        ctx.fill();
+      }
     }
 
     canvas.addEventListener('mousedown', (ev) => {
+      if (state.mode !== 'rect') return;
       if (!state.classes.length) { alert('Cadastre uma classe antes de desenhar.'); return; }
       const rect = canvas.getBoundingClientRect();
       state.drawing = true;
@@ -1357,27 +1461,75 @@ PAGE_HTML = """
     });
 
     canvas.addEventListener('mousemove', (ev) => {
-      if (!state.drawing) return;
       const rect = canvas.getBoundingClientRect();
       const curX = ev.clientX - rect.left, curY = ev.clientY - rect.top;
-      state.drawX = Math.min(state.startX, curX);
-      state.drawY = Math.min(state.startY, curY);
-      state.drawW = Math.abs(curX - state.startX);
-      state.drawH = Math.abs(curY - state.startY);
-      desenharCanvas();
+      if (state.mode === 'rect') {
+        if (!state.drawing) return;
+        state.drawX = Math.min(state.startX, curX);
+        state.drawY = Math.min(state.startY, curY);
+        state.drawW = Math.abs(curX - state.startX);
+        state.drawH = Math.abs(curY - state.startY);
+        desenharCanvas();
+      } else if (state.mode === 'poligono' && state.polyPoints.length) {
+        state.mouseX = curX; state.mouseY = curY;
+        desenharCanvas();
+      }
     });
 
     window.addEventListener('mouseup', () => {
-      if (!state.drawing) return;
+      if (state.mode !== 'rect' || !state.drawing) return;
       state.drawing = false;
       if (state.drawW > 4 && state.drawH > 4 && canvas.width > 0) {
-        state.boxes.push({
-          classe: state.activeClassIndex,
-          x: state.drawX / canvas.width, y: state.drawY / canvas.height,
-          w: state.drawW / canvas.width, h: state.drawH / canvas.height,
-        });
+        const x0 = state.drawX / canvas.width, y0 = state.drawY / canvas.height;
+        const w0 = state.drawW / canvas.width, h0 = state.drawH / canvas.height;
+        if (projetoTask === 'segment') {
+          state.boxes.push({
+            classe: state.activeClassIndex,
+            pontos: [[x0, y0], [x0 + w0, y0], [x0 + w0, y0 + h0], [x0, y0 + h0]],
+          });
+        } else {
+          state.boxes.push({ classe: state.activeClassIndex, x: x0, y: y0, w: w0, h: h0 });
+        }
         renderListaCaixas();
       } else {
+        desenharCanvas();
+      }
+    });
+
+    canvas.addEventListener('click', (ev) => {
+      if (state.mode !== 'poligono') return;
+      if (!state.classes.length) { alert('Cadastre uma classe antes de desenhar.'); return; }
+      const rect = canvas.getBoundingClientRect();
+      const x = ev.clientX - rect.left, y = ev.clientY - rect.top;
+      if (state.polyPoints.length >= 3) {
+        const [fx, fy] = state.polyPoints[0];
+        if (Math.hypot(x - fx, y - fy) <= 8) {
+          const pontos = state.polyPoints.map(([px, py]) => [px / canvas.width, py / canvas.height]);
+          state.boxes.push({ classe: state.activeClassIndex, pontos });
+          state.polyPoints = [];
+          state.mouseX = undefined;
+          renderListaCaixas();
+          return;
+        }
+      }
+      state.polyPoints.push([x, y]);
+      desenharCanvas();
+    });
+
+    document.querySelectorAll('input[name="modo-anotacao"]').forEach((r) => {
+      r.addEventListener('change', (ev) => {
+        state.mode = ev.target.value;
+        modoAnotacaoPreferido = state.mode;
+        localStorage.setItem('treinamento_modo_anotacao', modoAnotacaoPreferido);
+        state.polyPoints = [];
+        state.drawing = false;
+        desenharCanvas();
+      });
+    });
+
+    window.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape' && state.mode === 'poligono' && state.polyPoints.length) {
+        state.polyPoints = [];
         desenharCanvas();
       }
     });
@@ -1407,6 +1559,9 @@ PAGE_HTML = """
     document.getElementById('btn-salvar-anotacao').addEventListener('click', async () => {
       const destino = document.querySelector('input[name="destino"]:checked').value;
       const resultEl = document.getElementById('anotacao-resultado');
+      const caixas = projetoTask === 'segment'
+        ? state.boxes.map((b) => ({ classe: b.classe, pontos: b.pontos }))
+        : state.boxes.map((b) => ({ classe: b.classe, x: b.x + b.w / 2, y: b.y + b.h / 2, w: b.w, h: b.h }));
       const res = await fetch('/anotar', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1414,7 +1569,7 @@ PAGE_HTML = """
           pasta: state.currentImage.pasta,
           nome: state.currentImage.nome,
           destino,
-          caixas: state.boxes.map((b) => ({ classe: b.classe, x: b.x + b.w / 2, y: b.y + b.h / 2, w: b.w, h: b.h })),
+          caixas,
         }),
       });
       const data = await res.json();
@@ -1648,7 +1803,11 @@ def create_app(stream: CameraStream, titulo: str) -> Flask:
     def criar_projeto():
         data = request.get_json(silent=True) or {}
         try:
-            pp = create_project(str(data.get('nome', '')), data.get('classes_iniciais'))
+            pp = create_project(
+                str(data.get('nome', '')),
+                data.get('classes_iniciais'),
+                data.get('tipo', 'detect'),
+            )
         except ValueError as exc:
             return jsonify({'ok': False, 'erro': str(exc)}), 400
         return jsonify({'ok': True, 'projeto': pp.nome})
@@ -1728,6 +1887,7 @@ def create_app(stream: CameraStream, titulo: str) -> Flask:
             'pendentes': _listar(pp.capturas),
             'treino': _listar(pp.images_train, pp.labels_train),
             'validacao': _listar(pp.images_val, pp.labels_val),
+            'task': load_project_task(pp),
         })
 
     def _resolve_image_path(pp: ProjectPaths, pasta: str, nome: str):
@@ -1752,20 +1912,30 @@ def create_app(stream: CameraStream, titulo: str) -> Flask:
         nome = safe_name(request.args.get('nome', ''))
         mapping = {'treino': pp.labels_train, 'validacao': pp.labels_val}
         lbl_dir = mapping.get(pasta)
+        task = load_project_task(pp)
         caixas = []
         if lbl_dir is not None:
             lbl_path = lbl_dir / (Path(nome).stem + '.txt')
             if lbl_path.exists():
                 for linha in lbl_path.read_text(encoding='utf-8').splitlines():
                     partes = linha.strip().split()
-                    if len(partes) != 5:
+                    if not partes:
                         continue
                     try:
                         cls_id = int(partes[0])
-                        xc, yc, w, h = (float(v) for v in partes[1:])
+                        valores = [float(v) for v in partes[1:]]
                     except ValueError:
                         continue
-                    caixas.append({'classe': cls_id, 'x': xc - w / 2, 'y': yc - h / 2, 'w': w, 'h': h})
+                    if task == 'segment':
+                        if len(partes) < 7 or len(partes) % 2 == 0:
+                            continue
+                        pontos = [[valores[i], valores[i + 1]] for i in range(0, len(valores), 2)]
+                        caixas.append({'classe': cls_id, 'pontos': pontos})
+                    else:
+                        if len(partes) != 5:
+                            continue
+                        xc, yc, w, h = valores
+                        caixas.append({'classe': cls_id, 'x': xc - w / 2, 'y': yc - h / 2, 'w': w, 'h': h})
         return jsonify({'caixas': caixas})
 
     @app.post('/anotar')
@@ -1793,23 +1963,38 @@ def create_app(stream: CameraStream, titulo: str) -> Flask:
             return jsonify({'ok': False, 'erro': 'Imagem nao encontrada.'}), 404
 
         classes = load_classes(pp)
+        task = load_project_task(pp)
         linhas = []
         for caixa in caixas:
             try:
                 cls_id = int(caixa['classe'])
-                x = float(caixa['x'])
-                y = float(caixa['y'])
-                w = float(caixa['w'])
-                h = float(caixa['h'])
             except (KeyError, TypeError, ValueError):
                 continue
             if not (0 <= cls_id < len(classes)):
                 continue
-            x = min(max(x, 0.0), 1.0)
-            y = min(max(y, 0.0), 1.0)
-            w = min(max(w, 0.0), 1.0)
-            h = min(max(h, 0.0), 1.0)
-            linhas.append(f'{cls_id} {x:.6f} {y:.6f} {w:.6f} {h:.6f}')
+            if task == 'segment':
+                pontos = caixa.get('pontos')
+                if not isinstance(pontos, list) or len(pontos) < 3:
+                    continue
+                try:
+                    coords = [(min(max(float(p[0]), 0.0), 1.0), min(max(float(p[1]), 0.0), 1.0)) for p in pontos]
+                except (TypeError, ValueError, IndexError):
+                    continue
+                valores = ' '.join(f'{x:.6f} {y:.6f}' for x, y in coords)
+                linhas.append(f'{cls_id} {valores}')
+            else:
+                try:
+                    x = float(caixa['x'])
+                    y = float(caixa['y'])
+                    w = float(caixa['w'])
+                    h = float(caixa['h'])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                x = min(max(x, 0.0), 1.0)
+                y = min(max(y, 0.0), 1.0)
+                w = min(max(w, 0.0), 1.0)
+                h = min(max(h, 0.0), 1.0)
+                linhas.append(f'{cls_id} {x:.6f} {y:.6f} {w:.6f} {h:.6f}')
 
         dest_img_dir, dest_lbl_dir = destino_map[destino]
         dest_img_path = dest_img_dir / nome
