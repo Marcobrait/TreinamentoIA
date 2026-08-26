@@ -1450,19 +1450,25 @@ PAGE_HTML = """
       }
     }
 
+    function posicaoNoCanvas(ev) {
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+      return [(ev.clientX - rect.left) * scaleX, (ev.clientY - rect.top) * scaleY];
+    }
+
     canvas.addEventListener('mousedown', (ev) => {
       if (state.mode !== 'rect') return;
       if (!state.classes.length) { alert('Cadastre uma classe antes de desenhar.'); return; }
-      const rect = canvas.getBoundingClientRect();
+      const [px, py] = posicaoNoCanvas(ev);
       state.drawing = true;
-      state.startX = ev.clientX - rect.left;
-      state.startY = ev.clientY - rect.top;
+      state.startX = px;
+      state.startY = py;
       state.drawX = state.startX; state.drawY = state.startY; state.drawW = 0; state.drawH = 0;
     });
 
     canvas.addEventListener('mousemove', (ev) => {
-      const rect = canvas.getBoundingClientRect();
-      const curX = ev.clientX - rect.left, curY = ev.clientY - rect.top;
+      const [curX, curY] = posicaoNoCanvas(ev);
       if (state.mode === 'rect') {
         if (!state.drawing) return;
         state.drawX = Math.min(state.startX, curX);
@@ -1499,8 +1505,7 @@ PAGE_HTML = """
     canvas.addEventListener('click', (ev) => {
       if (state.mode !== 'poligono') return;
       if (!state.classes.length) { alert('Cadastre uma classe antes de desenhar.'); return; }
-      const rect = canvas.getBoundingClientRect();
-      const x = ev.clientX - rect.left, y = ev.clientY - rect.top;
+      const [x, y] = posicaoNoCanvas(ev);
       if (state.polyPoints.length >= 3) {
         const [fx, fy] = state.polyPoints[0];
         if (Math.hypot(x - fx, y - fy) <= 8) {
