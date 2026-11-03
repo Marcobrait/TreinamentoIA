@@ -16,7 +16,7 @@ if not exist config.cfg (
 )
 
 echo Iniciando pagina de treinamento...
-.venv\Scripts\python.exe web_treinamento.py
+.venv\Scripts\python.exe web_treinamento2.py
 
 echo.
 echo O processo foi encerrado.

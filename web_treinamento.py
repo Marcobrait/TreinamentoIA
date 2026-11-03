@@ -179,6 +179,74 @@ def build_rtsp_url(ip: str, usuario: str, senha: str, porta: str, caminho: str) 
     return f'rtsp://{usuario_escapado}:{senha_escapada}@{ip}:{porta}{caminho}'
 
 
+def update_config_section(config_path: Path, section: str, updates: dict) -> None:
+    """Atualiza (ou adiciona) chaves de uma secao do config.cfg preservando
+    comentarios, espacamento e o restante do arquivo como estao."""
+    lines = config_path.read_text(encoding='utf-8-sig').splitlines(keepends=True)
+    pending = dict(updates)
+
+    section_header = f'[{section}]'
+    section_start = None
+    section_end = len(lines)
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == section_header:
+            section_start = idx
+            continue
+        if section_start is not None and stripped.startswith('[') and stripped.endswith(']'):
+            section_end = idx
+            break
+
+    if section_start is None:
+        if lines and not lines[-1].endswith('\n'):
+            lines[-1] += '\n'
+        lines.append(f'\n[{section}]\n')
+        lines.extend(f'{key} = {value}\n' for key, value in pending.items())
+        config_path.write_text(''.join(lines), encoding='utf-8')
+        return
+
+    for idx in range(section_start + 1, section_end):
+        stripped = lines[idx].strip()
+        if not stripped or stripped.startswith('#') or '=' not in stripped:
+            continue
+        key = stripped.split('=', 1)[0].strip()
+        if key in pending:
+            value = pending.pop(key)
+            newline = '\n' if lines[idx].endswith('\n') else ''
+            lines[idx] = f'{key} = {value}{newline}'
+
+    if pending:
+        novas_linhas = [f'{key} = {value}\n' for key, value in pending.items()]
+        lines[section_end:section_end] = novas_linhas
+
+    config_path.write_text(''.join(lines), encoding='utf-8')
+
+
+def remove_config_section(config_path: Path, section: str) -> None:
+    """Remove uma secao inteira do config.cfg (usado ao excluir uma camera)."""
+    lines = config_path.read_text(encoding='utf-8-sig').splitlines(keepends=True)
+    section_header = f'[{section}]'
+    section_start = None
+    section_end = len(lines)
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == section_header:
+            section_start = idx
+            continue
+        if section_start is not None and stripped.startswith('[') and stripped.endswith(']'):
+            section_end = idx
+            break
+    if section_start is None:
+        return
+    del lines[section_start:section_end]
+    config_path.write_text(''.join(lines), encoding='utf-8')
+
+
+def load_ids_list(parser: configparser.ConfigParser, section: str, key: str = 'ids') -> list:
+    raw = parser.get(section, key, fallback='').strip()
+    return [parte.strip() for parte in raw.split(',') if parte.strip()]
+
+
 class CameraStream:
     def __init__(self, rtsp_url: str) -> None:
         self.rtsp_url = rtsp_url
@@ -228,6 +296,169 @@ class CameraStream:
         if self._thread is not None:
             self._thread.join(timeout=1.0)
         self.cap.release()
+
+
+class CameraManager:
+    """Mantem a lista de cameras cadastradas (persistida no config.cfg, em
+    [cameras] + [camera_<id>]) e o CameraStream da camera ATIVA no momento,
+    usado pela tela de Treinamento (video ao vivo / captura de frames).
+    Trocar de camera ativa troca o stream em tempo real, sem reiniciar o
+    programa."""
+
+    def __init__(self, parser: configparser.ConfigParser) -> None:
+        self.lock = threading.Lock()
+        self.cameras = {}
+        self.active_id = None
+        self.stream = None
+        self._proximo_id = parser.getint('cameras', 'proximo_id', fallback=1)
+        self._carregar(parser)
+
+    def _carregar(self, parser: configparser.ConfigParser) -> None:
+        ids = load_ids_list(parser, 'cameras')
+        if not ids and 'camera' in parser:
+            # Compatibilidade: config.cfg antigos so tinham uma [camera]
+            # unica. Na primeira vez que abrir com o CameraManager, isso
+            # migra automaticamente pra virar a "camera 1" da lista nova,
+            # sem precisar recadastrar nada.
+            cam = parser['camera']
+            dados = {
+                'nome': 'Camera principal',
+                'ip': cam.get('ip', '').strip(),
+                'usuario': cam.get('usuario', '').strip(),
+                'senha': cam.get('senha', '').strip(),
+                'porta': cam.get('porta', '554').strip() or '554',
+                'caminho': cam.get('caminho', '/cam/realmonitor?channel=1&subtype=0').strip(),
+            }
+            self.cameras['1'] = dados
+            self._proximo_id = 2
+            self.active_id = '1'
+            try:
+                update_config_section(CONFIG_FILE, 'cameras', {'ids': '1', 'ativa_id': '1', 'proximo_id': '2'})
+                update_config_section(CONFIG_FILE, 'camera_1', dados)
+            except Exception:
+                pass
+            return
+
+        for cam_id in ids:
+            section = f'camera_{cam_id}'
+            self.cameras[cam_id] = {
+                'nome': parser.get(section, 'nome', fallback=f'Camera {cam_id}').strip() or f'Camera {cam_id}',
+                'ip': parser.get(section, 'ip', fallback='').strip(),
+                'usuario': parser.get(section, 'usuario', fallback='').strip(),
+                'senha': parser.get(section, 'senha', fallback='').strip(),
+                'porta': parser.get(section, 'porta', fallback='554').strip() or '554',
+                'caminho': parser.get(section, 'caminho', fallback='/cam/realmonitor?channel=1&subtype=0').strip(),
+            }
+        ativa = parser.get('cameras', 'ativa_id', fallback='').strip()
+        self.active_id = ativa if ativa in self.cameras else (ids[0] if ids else None)
+
+    def iniciar(self) -> None:
+        """Conecta na camera ativa (chamado uma vez, ao subir o programa).
+        Se falhar, so registra o erro -- o resto do app continua de pe pra
+        dar pra trocar/cadastrar outra camera pela tela."""
+        if not self.active_id or self.active_id not in self.cameras:
+            raise RuntimeError('Nenhuma camera cadastrada ainda. Adicione uma na tela de Cameras.')
+        cam = self.cameras[self.active_id]
+        rtsp = build_rtsp_url(cam['ip'], cam['usuario'], cam['senha'], cam['porta'], cam['caminho'])
+        stream = CameraStream(rtsp)
+        if not stream.is_opened():
+            stream.stop()
+            raise RuntimeError(f"Nao foi possivel abrir o stream RTSP da camera \"{cam['nome']}\". Verifique IP/usuario/senha.")
+        stream.start()
+        with self.lock:
+            self.stream = stream
+
+    def get_frame(self):
+        with self.lock:
+            stream = self.stream
+        return stream.get_frame() if stream is not None else None
+
+    def status(self) -> dict:
+        with self.lock:
+            conectada = self.stream is not None and self.stream.is_opened()
+        return {'ativa_id': self.active_id, 'conectada': conectada}
+
+    def listar(self) -> list:
+        """Lista as cameras sem expor a senha (nao precisa ir pro navegador
+        so pra mostrar a lista)."""
+        return [
+            {
+                'id': cam_id,
+                'ativa': cam_id == self.active_id,
+                'nome': dados['nome'],
+                'ip': dados['ip'],
+                'porta': dados['porta'],
+                'caminho': dados['caminho'],
+            }
+            for cam_id, dados in self.cameras.items()
+        ]
+
+    def adicionar(self, nome: str, ip: str, usuario: str, senha: str, porta: str, caminho: str) -> str:
+        ip = (ip or '').strip()
+        usuario = (usuario or '').strip()
+        senha = (senha or '').strip()
+        if not ip or not usuario or not senha:
+            raise ValueError('Preencha IP, usuario e senha da camera.')
+        cam_id = str(self._proximo_id)
+        nome = (nome or '').strip() or f'Camera {cam_id}'
+        porta = (porta or '554').strip() or '554'
+        caminho = (caminho or '/cam/realmonitor?channel=1&subtype=0').strip()
+        if not caminho.startswith('/'):
+            caminho = '/' + caminho
+
+        self._proximo_id += 1
+        dados = {'nome': nome, 'ip': ip, 'usuario': usuario, 'senha': senha, 'porta': porta, 'caminho': caminho}
+        self.cameras[cam_id] = dados
+
+        try:
+            update_config_section(CONFIG_FILE, 'cameras', {
+                'ids': ','.join(self.cameras.keys()),
+                'proximo_id': str(self._proximo_id),
+            })
+            update_config_section(CONFIG_FILE, f'camera_{cam_id}', dados)
+        except Exception:
+            pass
+        return cam_id
+
+    def remover(self, cam_id: str) -> None:
+        if cam_id not in self.cameras:
+            raise ValueError('Camera nao encontrada.')
+        if cam_id == self.active_id:
+            raise ValueError('Essa e a camera ativa no momento -- ative outra antes de remover essa.')
+        del self.cameras[cam_id]
+        try:
+            update_config_section(CONFIG_FILE, 'cameras', {'ids': ','.join(self.cameras.keys())})
+            remove_config_section(CONFIG_FILE, f'camera_{cam_id}')
+        except Exception:
+            pass
+
+    def ativar(self, cam_id: str) -> None:
+        if cam_id not in self.cameras:
+            raise ValueError('Camera nao encontrada.')
+        cam = self.cameras[cam_id]
+        rtsp = build_rtsp_url(cam['ip'], cam['usuario'], cam['senha'], cam['porta'], cam['caminho'])
+        novo_stream = CameraStream(rtsp)
+        if not novo_stream.is_opened():
+            novo_stream.stop()
+            raise RuntimeError('Nao foi possivel conectar nessa camera. Confira IP, usuario, senha e porta.')
+        novo_stream.start()
+        with self.lock:
+            antiga = self.stream
+            self.stream = novo_stream
+            self.active_id = cam_id
+        if antiga is not None:
+            antiga.stop()
+        try:
+            update_config_section(CONFIG_FILE, 'cameras', {'ativa_id': cam_id})
+        except Exception:
+            pass
+
+    def stop(self) -> None:
+        with self.lock:
+            stream = self.stream
+            self.stream = None
+        if stream is not None:
+            stream.stop()
 
 
 def load_classes(pp: ProjectPaths) -> list:
@@ -600,193 +831,321 @@ PAGE_HTML = """
   <title>Treinamento de Modelo - Contador IA</title>
   <style>
     :root {
-      --bg: #0b1220; --bg-elevated: #0d1526; --card: #141e33; --border: #223052;
-      --text: #e7ecf7; --text-muted: #8996b3; --text-faint: #5b6884;
-      --accent: #3b82f6; --ok: #22c55e; --err: #ef4444; --warn: #f59e0b;
-      --neutral: #64748b; --radius: 14px; --shadow: 0 10px 30px rgba(0,0,0,.35);
+      --bg: #f5f5f7; --bg-elevated: #ffffff; --card: #ffffff; --border: #d2d2d7;
+      --fill: rgba(0,0,0,.045); --fill-strong: rgba(0,0,0,.07);
+      --text: #1d1d1f; --text-muted: #6e6e73; --text-faint: #86868b;
+      --accent: #0071e3; --accent-tint: rgba(0,113,227,.1); --accent-hover: #0077ed; --accent-press: #005fc0;
+      --ok: #22c55e; --err: #ef4444; --warn: #f59e0b; --neutral: #86868b;
+      --radius: 20px; --radius-md: 12px; --radius-sm: 8px;
+      --shadow-sm: 0 1px 2px rgba(0,0,0,.04), 0 1px 1px rgba(0,0,0,.03);
+      --shadow: 0 1px 2px rgba(0,0,0,.03), 0 10px 28px rgba(0,0,0,.06);
+      --shadow-lg: 0 24px 64px rgba(0,0,0,.16), 0 4px 14px rgba(0,0,0,.08);
+      --ease: cubic-bezier(.25,.1,.25,1);
     }
     * { box-sizing: border-box; }
+    html { -webkit-tap-highlight-color: transparent; }
     body {
-      margin: 0; font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Arial, sans-serif;
-      background: var(--bg); color: var(--text);
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.47;
+      -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+      letter-spacing: -.006em;
     }
+    button, input, select { font-family: inherit; letter-spacing: inherit; }
+    ::selection { background: var(--accent); color: #fff; }
+
     .app-shell { display: flex; align-items: stretch; min-height: 100vh; }
     .sidebar {
-      flex: 0 0 130px; width: 130px; background: var(--bg-elevated); border-right: 1px solid var(--border);
-      display: flex; flex-direction: column; gap: 4px; padding: 18px 10px;
+      flex: 0 0 220px; width: 220px; background: var(--bg-elevated); border-right: 1px solid var(--border);
+      display: flex; flex-direction: column; gap: 2px; padding: 22px 12px;
     }
     .side-btn {
-      background: none; border: none; border-left: 3px solid transparent; color: var(--text-muted);
-      border-radius: 8px; padding: 10px 10px; text-align: left; cursor: pointer; font-size: 12.5px; font-weight: 600;
+      display: flex; align-items: center; gap: 10px;
+      background: none; border: none; color: var(--text-muted);
+      border-radius: 10px; padding: 9px 12px; text-align: left; cursor: pointer;
+      font-size: 13.5px; font-weight: 590; letter-spacing: -.006em;
+      transition: background-color .15s var(--ease), color .15s var(--ease);
     }
-    .side-btn:hover { color: var(--text); background: rgba(255,255,255,.05); }
-    .side-btn.active { color: var(--accent); background: rgba(59,130,246,.12); border-left-color: var(--accent); }
+    .side-btn svg { flex: 0 0 auto; width: 18px; height: 18px; opacity: .82; }
+    .side-btn:hover { color: var(--text); background: var(--fill); }
+    .side-btn.active { color: #fff; background: var(--accent); box-shadow: 0 1px 3px rgba(0,113,227,.35); }
+    .side-btn.active svg { opacity: 1; }
+    .side-btn:active { transform: scale(.98); }
     .app-main { flex: 1; min-width: 0; }
 
     header.topbar {
-      display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 24px;
-      background: var(--bg-elevated); border-bottom: 1px solid var(--border); flex-wrap: wrap;
+      display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 28px;
+      background: rgba(255,255,255,.78); border-bottom: 1px solid var(--border); flex-wrap: wrap;
+      position: sticky; top: 0; z-index: 20;
+      -webkit-backdrop-filter: saturate(180%) blur(20px); backdrop-filter: saturate(180%) blur(20px);
     }
     header.topbar .brand { display: flex; align-items: baseline; gap: 12px; }
-    header.topbar h1 { font-size: 16px; margin: 0; }
-    header.topbar span { font-size: 12px; color: var(--text-muted); }
+    header.topbar h1 { font-size: 21px; font-weight: 650; letter-spacing: -.02em; margin: 0; }
+    header.topbar span { font-size: 12.5px; color: var(--text-muted); }
 
     .projeto-row { display: flex; align-items: center; gap: 10px; }
     .projeto-row select {
-      background: var(--card); border: 1px solid var(--border); color: var(--text);
-      border-radius: 8px; padding: 8px 12px; font-size: 13px; min-width: 220px;
+      background: var(--fill); border: 1px solid transparent; color: var(--text);
+      border-radius: var(--radius-sm); padding: 8px 12px; font-size: 13px; min-width: 220px;
+      transition: background-color .15s var(--ease), border-color .15s var(--ease);
     }
+    .projeto-row select:hover { background: var(--fill-strong); }
+    .projeto-row select:focus { outline: none; background: #fff; border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-tint); }
 
-    main.content { max-width: 1240px; margin: 0 auto; padding: 20px 24px 60px; display: flex; flex-direction: column; gap: 20px; }
-    .hr-soft { border: none; border-top: 1px solid var(--border); margin: 10px 0; width: 100%; }
+    main.content { max-width: 1360px; margin: 0 auto; padding: 28px 28px 72px; display: flex; flex-direction: column; gap: 24px; }
+    .hr-soft { border: none; border-top: 1px solid var(--border); margin: 14px 0; width: 100%; }
     .tester-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-    @media (max-width: 720px) { .tester-grid { grid-template-columns: 1fr; } }
-    .tester-grid img { max-width: 100%; border-radius: 10px; background: #000; display: block; }
+    @media (max-width: 720px) { .tester-grid { grid-template-columns: 1fr; } .sidebar { flex-basis: 72px; width: 72px; } .side-btn span.label-text { display: none; } }
+    .tester-grid img { max-width: 100%; border-radius: var(--radius-md); background: #000; display: block; }
     .card {
-      background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
-      padding: 18px; box-shadow: var(--shadow);
+      background: var(--card); border: 1px solid rgba(0,0,0,.04); border-radius: var(--radius);
+      padding: 26px; box-shadow: var(--shadow);
     }
     .card h2 {
-      margin: 0 0 14px 0; font-size: 12px; text-transform: uppercase;
-      letter-spacing: .08em; color: var(--text-muted); font-weight: 700;
+      margin: 0 0 18px 0; font-size: 18px; font-weight: 600; letter-spacing: -.014em;
+      color: var(--text);
     }
-    .card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+    .card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
     .card-header h2 { margin: 0; }
 
-    .video-row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
-    .video-row img { width: 480px; max-width: 100%; border-radius: 10px; background: #000; display: block; }
-    .capture-panel { display: flex; flex-direction: column; gap: 10px; min-width: 180px; }
-    .hint { font-size: 12px; color: var(--text-muted); }
+    .video-row { display: flex; gap: 22px; flex-wrap: wrap; align-items: flex-start; }
+    .video-frame {
+      flex: 1 1 640px; min-width: 320px; max-width: 100%; border-radius: var(--radius-md);
+      overflow: hidden; background: #000; box-shadow: var(--shadow-sm); line-height: 0;
+    }
+    .video-frame img { width: 100%; max-width: 100%; display: block; transition: width .12s linear; }
+    .capture-panel { display: flex; flex-direction: column; gap: 18px; flex: 0 0 240px; min-width: 220px; }
+    .panel-block { display: flex; flex-direction: column; gap: 9px; }
+    .panel-label { font-size: 12px; font-weight: 600; color: var(--text-muted); }
+    .panel-divider { height: 1px; background: var(--border); }
+    .btn-block { width: 100%; text-align: center; }
+
+    .size-slider-row { display: flex; align-items: center; gap: 10px; }
+    .size-slider-row .hint { min-width: 48px; text-align: right; font-variant-numeric: tabular-nums; }
+    input[type="range"] {
+      -webkit-appearance: none; appearance: none; flex: 1; height: 4px; border-radius: 999px;
+      background: var(--fill-strong); outline: none; cursor: pointer;
+    }
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%; margin-top: -7px;
+      background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.25), 0 0 0 1px rgba(0,0,0,.06); cursor: pointer;
+    }
+    input[type="range"]::-moz-range-track { height: 4px; border-radius: 999px; background: transparent; }
+    input[type="range"]::-moz-range-thumb {
+      width: 18px; height: 18px; border-radius: 50%; border: none;
+      background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.25), 0 0 0 1px rgba(0,0,0,.06); cursor: pointer;
+    }
+
+    .file-picker {
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+      background: var(--fill); border: 1.5px dashed var(--border); border-radius: var(--radius-sm);
+      padding: 13px 10px; cursor: pointer; font-size: 12.5px; color: var(--text-muted); font-weight: 500;
+      transition: background-color .15s var(--ease), border-color .15s var(--ease), color .15s var(--ease);
+    }
+    .file-picker:hover { background: var(--fill-strong); border-color: var(--accent); color: var(--text); }
+    .file-picker svg { flex: 0 0 auto; width: 16px; height: 16px; }
+    .hint { font-size: 12.5px; color: var(--text-muted); }
     .hint.ok { color: var(--ok); }
     .hint.err { color: var(--err); }
 
     .btn-primary {
-      background: var(--accent); border: none; border-radius: 8px; padding: 10px 18px;
-      color: #fff; font-size: 13px; font-weight: 600; cursor: pointer;
+      background: var(--accent); border: none; border-radius: 980px; padding: 10px 20px;
+      color: #fff; font-size: 13.5px; font-weight: 590; cursor: pointer;
+      transition: background-color .15s var(--ease), transform .1s var(--ease);
     }
-    .btn-primary:hover { background: #2f6fe0; }
-    .btn-primary:disabled { background: var(--neutral); cursor: not-allowed; }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-primary:active { background: var(--accent-press); transform: scale(.97); }
+    .btn-primary:disabled { background: var(--neutral); cursor: not-allowed; transform: none; }
     .btn-secondary {
-      background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 9px 16px;
-      color: var(--text); font-size: 13px; font-weight: 600; cursor: pointer;
+      background: var(--fill); border: none; border-radius: 980px; padding: 9px 18px;
+      color: var(--text); font-size: 13.5px; font-weight: 590; cursor: pointer;
+      transition: background-color .15s var(--ease), transform .1s var(--ease);
     }
-    .btn-secondary:hover { border-color: var(--accent); }
+    .btn-secondary:hover { background: var(--fill-strong); }
+    .btn-secondary:active { transform: scale(.97); }
 
     .chip-list { display: flex; flex-wrap: wrap; gap: 8px; }
     .chip-select {
-      border: 1px solid var(--border); background: var(--bg); color: var(--text);
-      border-radius: 999px; padding: 6px 12px; font-size: 12px; cursor: pointer;
+      border: 1px solid transparent; background: var(--fill); color: var(--text);
+      border-radius: 999px; padding: 6px 14px; font-size: 12.5px; font-weight: 500; cursor: pointer;
       border-left: 4px solid var(--chip-color, var(--accent));
+      transition: background-color .15s var(--ease), transform .1s var(--ease);
     }
-    .chip-select.active { background: rgba(59,130,246,.18); border-color: var(--accent); }
+    .chip-select:hover { background: var(--fill-strong); }
+    .chip-select:active { transform: scale(.96); }
+    .chip-select.active { background: var(--accent-tint); border-color: var(--accent); color: var(--accent); font-weight: 600; }
 
-    .inline-form { display: flex; gap: 8px; margin-top: 12px; }
+    .inline-form { display: flex; gap: 8px; margin-top: 14px; }
     .inline-form input {
-      flex: 1; max-width: 260px; background: var(--bg); border: 1px solid var(--border);
-      border-radius: 8px; padding: 8px 12px; color: var(--text); font-size: 13px;
+      flex: 1; max-width: 260px; background: var(--fill); border: 1px solid transparent;
+      border-radius: var(--radius-sm); padding: 9px 13px; color: var(--text); font-size: 13.5px;
+      transition: background-color .15s var(--ease), border-color .15s var(--ease);
     }
+    .inline-form input:focus { outline: none; background: #fff; border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-tint); }
     .inline-form button {
-      background: var(--card); border: 1px solid var(--border); border-radius: 8px;
-      padding: 8px 14px; color: var(--text); font-size: 13px; cursor: pointer;
+      background: var(--fill); border: none; border-radius: var(--radius-sm);
+      padding: 9px 16px; color: var(--text); font-size: 13.5px; font-weight: 590; cursor: pointer;
+      transition: background-color .15s var(--ease), transform .1s var(--ease);
     }
-    .inline-form button:hover { border-color: var(--accent); }
+    .inline-form button:hover { background: var(--fill-strong); }
+    .inline-form button:active { transform: scale(.97); }
 
-    .tabs { display: flex; gap: 8px; }
+    .tabs { display: inline-flex; gap: 2px; background: var(--fill); border-radius: 10px; padding: 3px; }
     .tab-btn {
-      background: var(--bg); border: 1px solid var(--border); color: var(--text-muted);
-      border-radius: 8px; padding: 6px 12px; font-size: 12px; cursor: pointer;
+      background: transparent; border: 1px solid transparent; color: var(--text-muted);
+      border-radius: 8px; padding: 6px 14px; font-size: 12.5px; font-weight: 590; cursor: pointer;
+      transition: background-color .18s var(--ease), color .18s var(--ease), box-shadow .18s var(--ease);
     }
-    .tab-btn.active { background: rgba(59,130,246,.14); color: var(--accent); border-color: var(--accent); }
+    .tab-btn.active { background: #fff; color: var(--text); border-color: transparent; box-shadow: 0 1px 4px rgba(0,0,0,.12); }
 
-    .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
-    .thumb { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; position: relative; }
+    .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 14px; }
+    .thumb {
+      background: var(--fill); border: 1px solid rgba(0,0,0,.04); border-radius: var(--radius-md);
+      overflow: hidden; position: relative; box-shadow: var(--shadow-sm);
+      transition: transform .18s var(--ease), box-shadow .18s var(--ease);
+    }
+    .thumb:hover { transform: translateY(-3px); box-shadow: 0 10px 24px rgba(0,0,0,.12); }
     .thumb img { width: 100%; height: 110px; object-fit: cover; display: block; background: #000; }
     .thumb-badge {
-      position: absolute; top: 6px; right: 6px; font-size: 10px; font-weight: 700;
-      padding: 2px 6px; border-radius: 999px; background: rgba(0,0,0,.6);
+      position: absolute; top: 8px; right: 8px; font-size: 10px; font-weight: 700;
+      padding: 3px 8px; border-radius: 999px; background: rgba(0,0,0,.55);
+      -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); color: #fff;
     }
-    .thumb-badge.ok { color: var(--ok); }
-    .thumb-badge.warn { color: var(--warn); }
-    .thumb-actions { display: flex; flex-direction: column; gap: 4px; padding: 8px; }
+    .thumb-badge.ok { color: #6bf29a; }
+    .thumb-badge.warn { color: #ffc257; }
+    .thumb-classes {
+      position: absolute; bottom: 8px; left: 8px; display: flex; gap: 4px;
+      padding: 4px 6px; border-radius: 999px; background: rgba(0,0,0,.55);
+      -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+    }
+    .thumb-dot { width: 8px; height: 8px; border-radius: 50%; box-shadow: 0 0 0 1px rgba(255,255,255,.5); }
+    .thumb-actions { display: flex; flex-direction: column; gap: 5px; padding: 9px; }
     .thumb-btn {
-      background: var(--card); border: 1px solid var(--border); color: var(--text);
-      border-radius: 6px; padding: 5px 8px; font-size: 11px; cursor: pointer;
+      background: #fff; border: 1px solid rgba(0,0,0,.06); color: var(--text);
+      border-radius: var(--radius-sm); padding: 6px 8px; font-size: 11px; font-weight: 500; cursor: pointer;
+      transition: background-color .15s var(--ease), color .15s var(--ease), border-color .15s var(--ease);
     }
-    .thumb-btn:hover { border-color: var(--accent); }
-    .thumb-btn.danger:hover { border-color: var(--err); color: var(--err); }
+    .thumb-btn:hover { background: var(--accent-tint); border-color: var(--accent); color: var(--accent); }
+    .thumb-btn.danger:hover { background: rgba(239,68,68,.1); border-color: var(--err); color: var(--err); }
 
     .training-form { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; }
     .training-form label {
-      display: flex; flex-direction: column; gap: 4px; font-size: 11.5px; color: var(--text-muted);
+      display: flex; flex-direction: column; gap: 6px; font-size: 12px; font-weight: 500; color: var(--text-muted);
     }
     .training-form input, .training-form select {
-      background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
-      padding: 8px 10px; color: var(--text); font-size: 13px; min-width: 140px;
+      background: var(--fill); border: 1px solid transparent; border-radius: var(--radius-sm);
+      padding: 9px 11px; color: var(--text); font-size: 13.5px; min-width: 140px;
+      transition: background-color .15s var(--ease), border-color .15s var(--ease);
+    }
+    .training-form input:focus, .training-form select:focus {
+      outline: none; background: #fff; border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-tint);
     }
 
-    .training-progress { margin-top: 18px; }
-    .progress-bar { background: var(--bg); border: 1px solid var(--border); border-radius: 999px; height: 10px; overflow: hidden; }
-    .progress-fill { height: 100%; width: 0%; background: var(--accent); transition: width .3s ease; }
-    #progress-text { margin-top: 8px; font-size: 12.5px; color: var(--text-muted); }
-    .metrics-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    .training-progress { margin-top: 20px; }
+    .progress-bar { background: var(--fill); border-radius: 999px; height: 8px; overflow: hidden; }
+    .progress-fill { height: 100%; width: 0%; background: var(--accent); transition: width .4s var(--ease); }
+    #progress-text { margin-top: 10px; font-size: 12.5px; color: var(--text-muted); font-weight: 500; }
+    .metrics-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
     .metric-pill {
-      font-size: 11px; background: var(--bg); border: 1px solid var(--border); border-radius: 999px;
-      padding: 4px 10px; color: var(--text-muted);
+      font-size: 11.5px; background: var(--fill); border-radius: 999px; font-weight: 500;
+      padding: 4px 11px; color: var(--text-muted);
     }
     .log-box {
-      margin-top: 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
-      padding: 10px; font-size: 11px; color: var(--text-muted); max-height: 180px; overflow-y: auto;
-      white-space: pre-wrap;
+      margin-top: 12px; background: #1d1d1f; border-radius: var(--radius-md);
+      padding: 14px; font-size: 11.5px; color: #c8c8cd; max-height: 180px; overflow-y: auto;
+      white-space: pre-wrap; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
     }
 
     .results-list { display: flex; flex-direction: column; gap: 14px; }
-    .result-card { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
-    .result-header { display: flex; justify-content: space-between; margin-bottom: 8px; }
-    .result-images { display: flex; gap: 8px; overflow-x: auto; margin-bottom: 10px; }
-    .result-images img { height: 130px; border-radius: 6px; border: 1px solid var(--border); }
+    .result-card { background: var(--fill); border-radius: var(--radius-md); padding: 16px; }
+    .result-header { display: flex; justify-content: space-between; margin-bottom: 10px; }
+    .result-header strong { font-weight: 600; }
+    .result-images { display: flex; gap: 8px; overflow-x: auto; margin-bottom: 12px; }
+    .result-images img { height: 130px; border-radius: var(--radius-sm); }
+
+    .camera-list { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; }
+    .camera-row {
+      display: flex; align-items: center; gap: 12px; background: var(--fill);
+      border-radius: var(--radius-md); padding: 13px 16px;
+      transition: background-color .15s var(--ease);
+    }
+    .camera-row.ativa { background: var(--accent-tint); box-shadow: inset 0 0 0 1px rgba(0,113,227,.25); }
+    .camera-dot {
+      width: 9px; height: 9px; border-radius: 50%; background: var(--neutral); flex: 0 0 auto;
+      box-shadow: 0 0 0 3px rgba(134,134,139,.15);
+    }
+    .camera-dot.ok { background: var(--ok); box-shadow: 0 0 0 3px rgba(34,197,94,.18); }
+    .camera-dot.err { background: var(--err); box-shadow: 0 0 0 3px rgba(239,68,68,.18); }
+    .camera-info { display: flex; flex-direction: column; gap: 2px; flex: 1 1 auto; min-width: 0; }
+    .camera-info strong { font-size: 13.5px; font-weight: 600; }
+    .camera-info span { font-size: 11.5px; color: var(--text-muted); }
+    .camera-badge-ativa {
+      font-size: 10.5px; font-weight: 700; letter-spacing: .02em; color: var(--accent);
+      background: rgba(0,113,227,.14); border: none;
+      border-radius: 999px; padding: 4px 11px; flex: 0 0 auto;
+    }
+    .camera-actions { display: flex; gap: 8px; flex: 0 0 auto; }
+    .camera-actions button { white-space: nowrap; }
 
     .modal {
-      position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none;
+      position: fixed; inset: 0; background: rgba(0,0,0,.42); display: none;
       align-items: center; justify-content: center; z-index: 100; padding: 20px;
+      -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
     }
     .modal-box {
-      background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
-      max-width: 1100px; width: 100%; max-height: 92vh; overflow-y: auto; box-shadow: var(--shadow);
+      background: var(--card); border: none; border-radius: 24px;
+      max-width: 1100px; width: 100%; max-height: 92vh; overflow-y: auto; box-shadow: var(--shadow-lg);
     }
     .modal-header {
       display: flex; align-items: center; justify-content: space-between;
-      padding: 14px 18px; border-bottom: 1px solid var(--border);
+      padding: 18px 22px; border-bottom: 1px solid var(--border);
     }
-    .modal-body { display: flex; gap: 18px; padding: 18px; flex-wrap: wrap; }
+    .modal-header strong { font-size: 16px; font-weight: 600; letter-spacing: -.012em; }
+    .modal-body { display: flex; gap: 20px; padding: 22px; flex-wrap: wrap; }
     .canvas-wrap { flex: 1 1 480px; }
     .canvas-nav-row { display: flex; align-items: center; gap: 10px; }
-    .nav-arrow { flex: 0 0 auto; width: 34px; height: 34px; font-size: 20px; }
+    .nav-arrow { flex: 0 0 auto; width: 34px; height: 34px; font-size: 18px; border-radius: 999px; }
     .nav-arrow:disabled { opacity: .3; cursor: not-allowed; }
-    #anotacao-canvas { flex: 1 1 auto; min-width: 0; max-width: 100%; border-radius: 8px; background: #000; cursor: crosshair; }
+    #anotacao-canvas { flex: 1 1 auto; min-width: 0; max-width: 100%; border-radius: var(--radius-md); background: #000; cursor: crosshair; }
     .modal-side { flex: 0 0 260px; display: flex; flex-direction: column; gap: 6px; }
-    .modal-side h3 { font-size: 11px; text-transform: uppercase; color: var(--text-muted); margin: 10px 0 4px; }
+    .modal-side h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-muted); font-weight: 700; margin: 12px 0 6px; }
     .boxes-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
     .boxes-list li { font-size: 12.5px; display: flex; align-items: center; gap: 6px; }
-    .link-btn-sm { background: none; border: none; color: var(--accent); font-size: 11px; cursor: pointer; margin-left: auto; }
+    .link-btn-sm { background: none; border: none; color: var(--accent); font-size: 11.5px; font-weight: 500; cursor: pointer; margin-left: auto; }
     .radio-row { display: flex; gap: 14px; font-size: 12.5px; }
     .icon-btn {
-      background: var(--bg); border: 1px solid var(--border); color: var(--text-muted);
-      border-radius: 8px; width: 28px; height: 28px; cursor: pointer; font-size: 16px; line-height: 1;
+      background: var(--fill); border: none; color: var(--text-muted);
+      border-radius: var(--radius-sm); width: 30px; height: 30px; cursor: pointer; font-size: 16px; line-height: 1;
+      transition: background-color .15s var(--ease), color .15s var(--ease), transform .1s var(--ease);
     }
+    .icon-btn:hover { background: var(--fill-strong); color: var(--text); }
+    .icon-btn:active { transform: scale(.94); }
     .field-label {
-      display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--text-muted); width: 100%;
+      display: flex; flex-direction: column; gap: 6px; font-size: 12px; font-weight: 500; color: var(--text-muted); width: 100%;
     }
     .field-label input {
-      background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
-      padding: 9px 12px; color: var(--text); font-size: 13px;
+      background: var(--fill); border: 1px solid transparent; border-radius: var(--radius-sm);
+      padding: 9px 13px; color: var(--text); font-size: 13.5px;
+      transition: background-color .15s var(--ease), border-color .15s var(--ease);
     }
+    .field-label input:focus { outline: none; background: #fff; border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-tint); }
   </style>
 </head>
 <body>
   <div class="app-shell">
     <nav class="sidebar">
-      <button type="button" class="side-btn active" data-view="treinamento">Treinamento</button>
-      <button type="button" class="side-btn" data-view="testador">Testador IA</button>
+      <button type="button" class="side-btn active" data-view="treinamento">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="3"/><path d="M12 3.5v2.2M12 18.3v2.2M20.5 12h-2.2M5.7 12H3.5"/></svg>
+        <span class="label-text">Treinamento</span>
+      </button>
+      <button type="button" class="side-btn" data-view="cameras">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8.5a2 2 0 0 1 2-2h1.2l.9-1.4a2 2 0 0 1 1.68-.9h4.44a2 2 0 0 1 1.68.9l.9 1.4H18a2 2 0 0 1 2 2v8.3a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2Z"/><circle cx="12" cy="13" r="3.4"/></svg>
+        <span class="label-text">Cameras</span>
+      </button>
+      <button type="button" class="side-btn" data-view="testador">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6M10 3v5.2L5.6 16a2 2 0 0 0 1.7 3h9.4a2 2 0 0 0 1.7-3L14 8.2V3"/><path d="M7.5 14h9"/></svg>
+        <span class="label-text">Testador IA</span>
+      </button>
     </nav>
     <div class="app-main">
   <header class="topbar">
@@ -804,16 +1163,37 @@ PAGE_HTML = """
     <section class="card">
       <h2>Camera ao vivo</h2>
       <div class="video-row">
-        <img src="/video_feed" alt="video" />
+        <div class="video-frame">
+          <img id="video-feed-img" src="/video_feed" alt="video" />
+        </div>
         <div class="capture-panel">
-          <button id="btn-capturar" class="btn-primary">Capturar frame</button>
-          <div id="captura-resultado" class="hint"></div>
-          <hr class="hr-soft" />
-          <label class="field-label">Ou envie fotos prontas (em vez de capturar da camera)
-            <input type="file" id="input-upload-fotos" accept="image/jpeg,image/png" multiple />
-          </label>
-          <button id="btn-upload-fotos" class="btn-secondary">Enviar fotos</button>
-          <div id="upload-resultado" class="hint"></div>
+          <div class="panel-block">
+            <span class="panel-label">Tamanho do video</span>
+            <div class="size-slider-row">
+              <input type="range" id="video-tamanho" min="360" max="1180" step="20" value="760" />
+              <span id="video-tamanho-valor" class="hint">760px</span>
+            </div>
+          </div>
+
+          <div class="panel-divider"></div>
+
+          <div class="panel-block">
+            <button id="btn-capturar" class="btn-primary btn-block">Capturar frame</button>
+            <div id="captura-resultado" class="hint"></div>
+          </div>
+
+          <div class="panel-divider"></div>
+
+          <div class="panel-block">
+            <span class="panel-label">Ou envie fotos prontas</span>
+            <label class="file-picker" for="input-upload-fotos">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M12 4 7.5 8.5M12 4l4.5 4.5"/><path d="M4 15.5V18a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2.5"/></svg>
+              <span id="upload-picker-texto">Escolher fotos</span>
+            </label>
+            <input type="file" id="input-upload-fotos" accept="image/jpeg,image/png" multiple style="display:none" />
+            <button id="btn-upload-fotos" class="btn-secondary btn-block">Enviar fotos</button>
+            <div id="upload-resultado" class="hint"></div>
+          </div>
         </div>
       </div>
     </section>
@@ -953,6 +1333,17 @@ PAGE_HTML = """
       </div>
     </section>
   </main>
+
+  <main class="content" id="view-cameras" style="display:none;">
+    <section class="card">
+      <div class="card-header">
+        <h2>Cameras cadastradas</h2>
+        <button type="button" id="btn-adicionar-camera" class="btn-primary">+ Adicionar camera</button>
+      </div>
+      <p class="hint">A camera ativa e usada na tela de Treinamento (video ao vivo e captura de frames). Ativar outra troca na hora, sem precisar reiniciar o programa.</p>
+      <div id="lista-cameras" class="camera-list"><p class="hint">Carregando cameras...</p></div>
+    </section>
+  </main>
     </div>
   </div>
 
@@ -1021,6 +1412,37 @@ PAGE_HTML = """
     </div>
   </div>
 
+  <div id="modal-camera" class="modal">
+    <div class="modal-box" style="max-width: 440px;">
+      <div class="modal-header">
+        <strong>Adicionar camera</strong>
+        <button id="modal-camera-fechar" class="icon-btn">&times;</button>
+      </div>
+      <div class="modal-body" style="flex-direction: column;">
+        <label class="field-label">Nome (so pra identificar na lista)
+          <input type="text" id="camera-nome" placeholder="Ex: Camera Linha 2" maxlength="80" autocomplete="off" />
+        </label>
+        <label class="field-label" style="margin-top: 10px;">IP
+          <input type="text" id="camera-ip" placeholder="10.0.0.10" autocomplete="off" />
+        </label>
+        <label class="field-label" style="margin-top: 10px;">Usuario
+          <input type="text" id="camera-usuario" placeholder="admin" autocomplete="off" />
+        </label>
+        <label class="field-label" style="margin-top: 10px;">Senha
+          <input type="password" id="camera-senha" autocomplete="off" />
+        </label>
+        <label class="field-label" style="margin-top: 10px;">Porta
+          <input type="text" id="camera-porta" value="554" autocomplete="off" />
+        </label>
+        <label class="field-label" style="margin-top: 10px;">Caminho RTSP
+          <input type="text" id="camera-caminho" placeholder="/cam/realmonitor?channel=1&amp;subtype=0" autocomplete="off" />
+        </label>
+        <button id="btn-salvar-camera" class="btn-primary" style="margin-top: 14px;">Salvar camera</button>
+        <div id="camera-resultado" class="hint"></div>
+      </div>
+    </div>
+  </div>
+
   <script>
     const PALETTE = ['#22c55e', '#f59e0b', '#3b82f6', '#ef4444', '#a855f7', '#14b8a6', '#eab308', '#ec4899'];
     const state = { classes: [], activeClassIndex: 0, currentImage: null, boxes: [], drawing: false, mode: 'rect', polyPoints: [] };
@@ -1035,8 +1457,10 @@ PAGE_HTML = """
         btn.classList.add('active');
         const view = btn.getAttribute('data-view');
         document.getElementById('view-treinamento').style.display = view === 'treinamento' ? 'flex' : 'none';
+        document.getElementById('view-cameras').style.display = view === 'cameras' ? 'flex' : 'none';
         document.getElementById('view-testador').style.display = view === 'testador' ? 'flex' : 'none';
         if (view === 'testador') carregarModelosTestador();
+        if (view === 'cameras') carregarCameras();
       });
     });
 
@@ -1133,6 +1557,131 @@ PAGE_HTML = """
       }
     });
 
+    const modalCamera = document.getElementById('modal-camera');
+    document.getElementById('btn-adicionar-camera').addEventListener('click', () => {
+      ['camera-nome', 'camera-ip', 'camera-usuario', 'camera-senha', 'camera-caminho'].forEach((id) => {
+        document.getElementById(id).value = '';
+      });
+      document.getElementById('camera-porta').value = '554';
+      document.getElementById('camera-resultado').textContent = '';
+      modalCamera.style.display = 'flex';
+    });
+    document.getElementById('modal-camera-fechar').addEventListener('click', () => { modalCamera.style.display = 'none'; });
+
+    document.getElementById('btn-salvar-camera').addEventListener('click', async () => {
+      const resultEl = document.getElementById('camera-resultado');
+      const payload = {
+        nome: document.getElementById('camera-nome').value.trim(),
+        ip: document.getElementById('camera-ip').value.trim(),
+        usuario: document.getElementById('camera-usuario').value.trim(),
+        senha: document.getElementById('camera-senha').value,
+        porta: document.getElementById('camera-porta').value.trim(),
+        caminho: document.getElementById('camera-caminho').value.trim(),
+      };
+      if (!payload.ip || !payload.usuario || !payload.senha) {
+        resultEl.textContent = 'Preencha pelo menos IP, usuario e senha.';
+        resultEl.className = 'hint err';
+        return;
+      }
+      resultEl.textContent = 'Salvando...';
+      resultEl.className = 'hint';
+      try {
+        const res = await fetch('/cameras', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          resultEl.textContent = 'Camera adicionada!';
+          resultEl.className = 'hint ok';
+          setTimeout(async () => { modalCamera.style.display = 'none'; await carregarCameras(); }, 400);
+        } else {
+          resultEl.textContent = data.erro || 'Falha ao adicionar camera.';
+          resultEl.className = 'hint err';
+        }
+      } catch (_) {
+        resultEl.textContent = 'Falha ao contatar o servidor.';
+        resultEl.className = 'hint err';
+      }
+    });
+
+    async function carregarCameras() {
+      const wrap = document.getElementById('lista-cameras');
+      try {
+        const res = await fetch('/cameras');
+        const data = await res.json();
+        const cameras = data.cameras || [];
+        const status = data.status || {};
+        if (!cameras.length) {
+          wrap.innerHTML = '<p class="hint">Nenhuma camera cadastrada ainda. Clique em "+ Adicionar camera".</p>';
+          return;
+        }
+        wrap.innerHTML = cameras.map((c) => {
+          const conectada = c.ativa && status.conectada;
+          const dotCls = !c.ativa ? 'camera-dot' : (conectada ? 'camera-dot ok' : 'camera-dot err');
+          const statusTexto = !c.ativa ? 'Inativa' : (conectada ? 'Ativa e conectada' : 'Ativa, conectando...');
+          return `
+            <div class="camera-row ${c.ativa ? 'ativa' : ''}">
+              <span class="${dotCls}"></span>
+              <div class="camera-info">
+                <strong>${c.nome}</strong>
+                <span>${c.ip}:${c.porta}${c.caminho} &middot; ${statusTexto}</span>
+              </div>
+              ${c.ativa ? '<span class="camera-badge-ativa">ATIVA</span>' : ''}
+              <div class="camera-actions">
+                ${c.ativa ? '' : `<button type="button" class="btn-secondary btn-ativar-camera" data-id="${c.id}">Ativar</button>`}
+                ${c.ativa ? '' : `<button type="button" class="btn-secondary btn-remover-camera" data-id="${c.id}">Remover</button>`}
+              </div>
+            </div>
+          `;
+        }).join('');
+        wrap.querySelectorAll('.btn-ativar-camera').forEach((btn) => {
+          btn.addEventListener('click', () => ativarCamera(btn.getAttribute('data-id'), btn));
+        });
+        wrap.querySelectorAll('.btn-remover-camera').forEach((btn) => {
+          btn.addEventListener('click', () => removerCamera(btn.getAttribute('data-id')));
+        });
+      } catch (_) {
+        wrap.innerHTML = '<p class="hint err">Falha ao carregar as cameras.</p>';
+      }
+    }
+
+    async function ativarCamera(id, btn) {
+      const textoOriginal = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = 'Conectando...';
+      try {
+        const res = await fetch(`/cameras/${id}/ativar`, { method: 'POST' });
+        const data = await res.json();
+        if (!data.ok) {
+          alert(data.erro || 'Falha ao ativar essa camera.');
+          btn.disabled = false;
+          btn.textContent = textoOriginal;
+          return;
+        }
+        await carregarCameras();
+      } catch (_) {
+        alert('Falha ao contatar o servidor.');
+        btn.disabled = false;
+        btn.textContent = textoOriginal;
+      }
+    }
+
+    async function removerCamera(id) {
+      if (!confirm('Remover essa camera da lista?')) return;
+      try {
+        const res = await fetch(`/cameras/${id}/remover`, { method: 'POST' });
+        const data = await res.json();
+        if (!data.ok) {
+          alert(data.erro || 'Falha ao remover essa camera.');
+          return;
+        }
+        await carregarCameras();
+      } catch (_) {
+        alert('Falha ao contatar o servidor.');
+      }
+    }
+
     async function carregarClasses() {
       const res = await fetch(`/classes?${qp()}`);
       state.classes = await res.json();
@@ -1170,6 +1719,31 @@ PAGE_HTML = """
       const data = await res.json();
       if (data.ok) { input.value = ''; await carregarClasses(); }
       else alert(data.erro || 'Falha ao adicionar classe.');
+    });
+
+    (function () {
+      const slider = document.getElementById('video-tamanho');
+      const valorEl = document.getElementById('video-tamanho-valor');
+      const img = document.getElementById('video-feed-img');
+      function aplicarTamanhoVideo(v) {
+        img.style.width = `${v}px`;
+        valorEl.textContent = `${v}px`;
+      }
+      let salvo = null;
+      try { salvo = localStorage.getItem('treinamento_video_largura'); } catch (_) {}
+      if (salvo && !Number.isNaN(parseInt(salvo, 10))) slider.value = salvo;
+      aplicarTamanhoVideo(slider.value);
+      slider.addEventListener('input', () => {
+        aplicarTamanhoVideo(slider.value);
+        try { localStorage.setItem('treinamento_video_largura', slider.value); } catch (_) {}
+      });
+    })();
+
+    const inputUploadFotos = document.getElementById('input-upload-fotos');
+    const uploadPickerTexto = document.getElementById('upload-picker-texto');
+    inputUploadFotos.addEventListener('change', () => {
+      const n = inputUploadFotos.files.length;
+      uploadPickerTexto.textContent = n === 0 ? 'Escolher fotos' : n === 1 ? '1 foto selecionada' : `${n} fotos selecionadas`;
     });
 
     document.getElementById('btn-capturar').addEventListener('click', async () => {
@@ -1214,6 +1788,7 @@ PAGE_HTML = """
           resultEl.textContent = `${data.salvos} foto(s) enviada(s) para "Pendentes".`;
           resultEl.className = 'hint ok';
           input.value = '';
+          uploadPickerTexto.textContent = 'Escolher fotos';
           carregarImagens();
         } else {
           resultEl.textContent = data.erro || 'Falha ao enviar.';
@@ -1269,6 +1844,11 @@ PAGE_HTML = """
         <div class="thumb" data-nome="${item.nome}">
           <img src="/imagem?${qp({ pasta: abaAtiva, nome: item.nome })}" loading="lazy" />
           ${item.anotado !== undefined ? `<span class="thumb-badge ${item.anotado ? 'ok' : 'warn'}">${item.anotado ? 'Anotada' : 'Sem anotacao'}</span>` : ''}
+          ${item.classes && item.classes.length ? `
+            <div class="thumb-classes" title="Classes nesta imagem: ${item.classes.map((i) => state.classes[i] || `classe ${i}`).join(', ')}">
+              ${item.classes.map((i) => `<span class="thumb-dot" style="background:${PALETTE[i % PALETTE.length]}"></span>`).join('')}
+            </div>
+          ` : ''}
           <div class="thumb-actions">
             <button class="thumb-btn" data-acao="anotar">Anotar</button>
             ${abaAtiva !== 'pendentes' ? `<button class="thumb-btn" data-acao="mover">${abaAtiva === 'treino' ? 'Mover p/ validacao' : 'Mover p/ treino'}</button>` : ''}
@@ -1564,6 +2144,7 @@ PAGE_HTML = """
     document.getElementById('btn-salvar-anotacao').addEventListener('click', async () => {
       const destino = document.querySelector('input[name="destino"]:checked').value;
       const resultEl = document.getElementById('anotacao-resultado');
+      const pastaOrigem = state.currentImage.pasta;
       const caixas = projetoTask === 'segment'
         ? state.boxes.map((b) => ({ classe: b.classe, pontos: b.pontos }))
         : state.boxes.map((b) => ({ classe: b.classe, x: b.x + b.w / 2, y: b.y + b.h / 2, w: b.w, h: b.h }));
@@ -1571,7 +2152,7 @@ PAGE_HTML = """
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           projeto: projetoAtual,
-          pasta: state.currentImage.pasta,
+          pasta: pastaOrigem,
           nome: state.currentImage.nome,
           destino,
           caixas,
@@ -1581,7 +2162,20 @@ PAGE_HTML = """
       if (data.ok) {
         resultEl.textContent = 'Salvo!';
         resultEl.className = 'hint ok';
-        setTimeout(() => { modal.style.display = 'none'; carregarImagens(); }, 500);
+        // Se a imagem ja estava organizada (treino/validacao) e voce esta so
+        // passando de uma pra outra revisando, nao faz sentido fechar o modal
+        // a cada save -- perderia o lugar de onde estava. Mantem a imagem
+        // aberta, so atualiza a galeria (contadores/miniaturas) por tras.
+        // Pra quem esta triando capturas novas (pendentes), continua fechando
+        // e voltando pra lista, que e o fluxo que ja fazia sentido ali.
+        if (pastaOrigem === 'treino' || pastaOrigem === 'validacao') {
+          state.currentImage.pasta = destino;
+          await carregarImagens();
+          atualizarNavegacaoAnotacao();
+          setTimeout(() => { resultEl.textContent = ''; resultEl.className = 'hint'; }, 1500);
+        } else {
+          setTimeout(() => { modal.style.display = 'none'; carregarImagens(); }, 500);
+        }
       } else {
         resultEl.textContent = data.erro || 'Falha ao salvar.';
         resultEl.className = 'hint err';
@@ -1660,7 +2254,12 @@ PAGE_HTML = """
         <div class="result-card">
           <div class="result-header"><strong>${r.nome}</strong><span class="hint">${r.modificado}</span></div>
           <div class="result-images">${r.imagens.map((img) => `<img src="/treinamento/resultados/${r.nome}/${img}?${qp()}" loading="lazy" />`).join('')}</div>
-          ${r.tem_modelo ? `<button class="btn-primary" data-run="${r.nome}">Usar este modelo</button>` : '<span class="hint">Sem best.pt gerado</span>'}
+          ${r.tem_modelo ? `
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+              <button class="btn-primary" data-run="${r.nome}">Usar este modelo</button>
+              <a class="btn-secondary" style="text-decoration:none; display:inline-flex; align-items:center;" href="/treinamento/resultados/${r.nome}/modelo/baixar?${qp()}">Baixar modelo (.pt)</a>
+            </div>
+          ` : '<span class="hint">Sem best.pt gerado</span>'}
         </div>
       `).join('');
       wrap.querySelectorAll('button[data-run]').forEach((btn) => {
@@ -1731,8 +2330,27 @@ PAGE_HTML = """
       }
     });
 
+    let configCameraCarregada = false;
+    async function preencherConfigCameraPadrao() {
+      if (configCameraCarregada) return;
+      configCameraCarregada = true;
+      try {
+        const res = await fetch('/config/camera');
+        const cfg = await res.json();
+        const campos = {
+          'test-cam-ip': cfg.ip, 'test-cam-usuario': cfg.usuario, 'test-cam-senha': cfg.senha,
+          'test-cam-porta': cfg.porta, 'test-cam-caminho': cfg.caminho,
+        };
+        Object.entries(campos).forEach(([id, valor]) => {
+          const el = document.getElementById(id);
+          if (el && valor) el.value = valor;
+        });
+      } catch (_) {}
+    }
+
     document.getElementById('test-video-ativo').addEventListener('change', (ev) => {
       document.getElementById('test-video-config').style.display = ev.target.checked ? 'block' : 'none';
+      if (ev.target.checked) preencherConfigCameraPadrao();
     });
 
     document.getElementById('btn-video-conectar').addEventListener('click', async () => {
@@ -1793,7 +2411,7 @@ PAGE_HTML = """
 """
 
 
-def create_app(stream: CameraStream, titulo: str) -> Flask:
+def create_app(camera_manager: CameraManager, titulo: str) -> Flask:
     app = Flask(__name__)
 
     @app.get('/')
@@ -1817,6 +2435,51 @@ def create_app(stream: CameraStream, titulo: str) -> Flask:
             return jsonify({'ok': False, 'erro': str(exc)}), 400
         return jsonify({'ok': True, 'projeto': pp.nome})
 
+    @app.get('/config/camera')
+    def config_camera():
+        cam = camera_manager.cameras.get(camera_manager.active_id) if camera_manager.active_id else None
+        if not cam:
+            return jsonify({'ip': '', 'usuario': '', 'senha': '', 'porta': '554', 'caminho': ''})
+        return jsonify({
+            'ip': cam['ip'],
+            'usuario': cam['usuario'],
+            'senha': cam['senha'],
+            'porta': cam['porta'],
+            'caminho': cam['caminho'],
+        })
+
+    @app.get('/cameras')
+    def listar_cameras():
+        return jsonify({'cameras': camera_manager.listar(), 'status': camera_manager.status()})
+
+    @app.post('/cameras')
+    def adicionar_camera():
+        data = request.get_json(silent=True) or {}
+        try:
+            cam_id = camera_manager.adicionar(
+                data.get('nome', ''), data.get('ip', ''), data.get('usuario', ''),
+                data.get('senha', ''), data.get('porta', ''), data.get('caminho', ''),
+            )
+        except ValueError as exc:
+            return jsonify({'ok': False, 'erro': str(exc)}), 400
+        return jsonify({'ok': True, 'id': cam_id})
+
+    @app.post('/cameras/<cam_id>/ativar')
+    def ativar_camera(cam_id):
+        try:
+            camera_manager.ativar(cam_id)
+        except (ValueError, RuntimeError) as exc:
+            return jsonify({'ok': False, 'erro': str(exc)}), 400
+        return jsonify({'ok': True})
+
+    @app.post('/cameras/<cam_id>/remover')
+    def remover_camera(cam_id):
+        try:
+            camera_manager.remover(cam_id)
+        except ValueError as exc:
+            return jsonify({'ok': False, 'erro': str(exc)}), 400
+        return jsonify({'ok': True})
+
     @app.get('/video_feed')
     def video_feed():
         def generate():
@@ -1828,7 +2491,7 @@ def create_app(stream: CameraStream, titulo: str) -> Flask:
                 if now - last_sent < interval:
                     time.sleep(0.02)
                     continue
-                frame = stream.get_frame()
+                frame = camera_manager.get_frame()
                 if frame is None:
                     time.sleep(0.02)
                     continue
@@ -1843,7 +2506,7 @@ def create_app(stream: CameraStream, titulo: str) -> Flask:
     def capturar():
         data = request.get_json(silent=True) or {}
         pp = get_project(data.get('projeto', ''))
-        frame = stream.get_frame()
+        frame = camera_manager.get_frame()
         if frame is None:
             return jsonify({'ok': False, 'erro': 'Sem frame disponivel da camera ainda.'}), 503
         nome = f"frame_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
@@ -1872,6 +2535,25 @@ def create_app(stream: CameraStream, titulo: str) -> Flask:
             return jsonify({'ok': False, 'erro': 'Nenhuma imagem valida enviada (use .jpg/.jpeg/.png).'}), 400
         return jsonify({'ok': True, 'salvos': salvos})
 
+    def _classes_no_label(lbl_path: Path) -> list:
+        """Le so a 1a coluna (indice da classe) de cada linha do .txt de anotacao
+        (formato YOLO, vale tanto pra caixa quanto pra poligono de segmentacao,
+        que sempre comecam com o indice da classe) -- usado pra mostrar nas
+        miniaturas quais classes aquela imagem tem, sem precisar abrir o modal
+        de anotacao pra descobrir."""
+        if not lbl_path.exists():
+            return []
+        indices = set()
+        for linha in lbl_path.read_text(encoding='utf-8').splitlines():
+            partes = linha.strip().split()
+            if not partes:
+                continue
+            try:
+                indices.add(int(partes[0]))
+            except ValueError:
+                continue
+        return sorted(indices)
+
     def _listar(pasta_dir: Path, label_dir=None):
         itens = []
         arquivos = []
@@ -1882,6 +2564,7 @@ def create_app(stream: CameraStream, titulo: str) -> Flask:
             if label_dir is not None:
                 lbl = label_dir / (p.stem + '.txt')
                 info['anotado'] = lbl.exists() and lbl.stat().st_size > 0
+                info['classes'] = _classes_no_label(lbl)
             itens.append(info)
         return itens
 
@@ -2134,6 +2817,17 @@ def create_app(stream: CameraStream, titulo: str) -> Flask:
             abort(404)
         return send_file(path)
 
+    @app.get('/treinamento/resultados/<run>/modelo/baixar')
+    def baixar_modelo_resultado(run):
+        """Baixa o best.pt de um treinamento concluido direto pelo navegador,
+        sem precisar copiar o arquivo manualmente no servidor."""
+        pp = get_project(request.args.get('projeto', ''))
+        best = pp.runs / safe_name(run) / 'weights' / 'best.pt'
+        if not best.exists():
+            abort(404)
+        nome_arquivo = f'{pp.nome}_{safe_name(run)}_best.pt'
+        return send_file(best, as_attachment=True, download_name=nome_arquivo)
+
     @app.post('/treinamento/aplicar/<run>')
     def aplicar_resultado(run):
         data = request.get_json(silent=True) or {}
@@ -2272,23 +2966,25 @@ def create_app(stream: CameraStream, titulo: str) -> Flask:
 
 def main() -> None:
     parser = load_config(CONFIG_FILE)
-    rtsp_url = load_rtsp_url(parser)
 
-    stream = CameraStream(rtsp_url)
-    if not stream.is_opened():
-        raise RuntimeError('Nao foi possivel abrir o stream RTSP. Verifique config/camera.')
-    stream.start()
+    camera_manager = CameraManager(parser)
+    try:
+        camera_manager.iniciar()
+    except RuntimeError as exc:
+        # Nao trava o programa por causa disso: o usuario pode cadastrar ou
+        # ativar outra camera pela tela de Cameras assim que o app subir.
+        print(f'[AVISO] {exc}')
 
     host = parser.get('web', 'host', fallback='0.0.0.0')
     port = parser.getint('web', 'porta', fallback=5011)
     titulo = parser.get('web', 'titulo', fallback='Treinamento de Modelo')
 
-    app = create_app(stream, titulo)
+    app = create_app(camera_manager, titulo)
     try:
         print(f'Web de treinamento rodando em http://{host}:{port}')
         app.run(host=host, port=port, debug=False, threaded=True)
     finally:
-        stream.stop()
+        camera_manager.stop()
 
 
 if __name__ == '__main__':
