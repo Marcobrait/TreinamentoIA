@@ -9,6 +9,7 @@ import json
 import shutil
 import threading
 import time
+import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -67,12 +68,18 @@ class ProjectPaths:
         self.labels_val = self.dataset / 'labels' / 'val'
         self.classes_file = self.dataset / 'classes.txt'
         self.task_file = self.dataset / 'task.txt'
+        # Dataset de classificacao do Ultralytics: train/<classe>/imagem.
+        # Fica separado do dataset YOLO para que os dois tipos de projeto nao
+        # misturem imagens ou anotacoes.
+        self.classify_dataset = self.root / 'dataset_classificacao'
         self.runs = self.root / 'runs_treinamento'
 
     def ensure(self) -> None:
         for d in (self.capturas, self.capturas_labels, self.images_train, self.images_val,
                   self.labels_train, self.labels_val, self.runs):
             d.mkdir(parents=True, exist_ok=True)
+        for split in ('train', 'valid', 'test'):
+            (self.classify_dataset / split).mkdir(parents=True, exist_ok=True)
         if not self.classes_file.exists():
             self.classes_file.write_text('', encoding='utf-8')
 
@@ -83,8 +90,8 @@ class ProjectPaths:
 def load_project_task(pp: ProjectPaths) -> str:
     if pp.task_file.exists():
         conteudo = pp.task_file.read_text(encoding='utf-8').strip()
-        if conteudo == 'segment':
-            return 'segment'
+        if conteudo in ('segment', 'classify'):
+            return conteudo
     return 'detect'
 
 
@@ -109,7 +116,7 @@ def create_project(nome: str, classes_iniciais=None, task: str = 'detect') -> Pr
     slug = slugify_projeto(nome)
     if not slug:
         raise ValueError('Nome do modelo nao pode ser vazio.')
-    if task not in ('detect', 'segment'):
+    if task not in ('detect', 'segment', 'classify'):
         raise ValueError('Tipo de treinamento invalido.')
     pp = ProjectPaths(slug)
     if pp.root.exists():
@@ -1031,6 +1038,33 @@ def desenhar_deteccoes(frame, resultado) -> list:
     return deteccoes
 
 
+def linhas_yolo_do_resultado(resultado, task: str, classes_destino: dict, altura: int, largura: int) -> list:
+    """Converte a saida do YOLO para o formato de anotacao do projeto de destino."""
+    linhas = []
+    masks_xy = resultado.masks.xy if resultado.masks is not None else None
+    nomes = resultado.names
+    for i, box in enumerate(resultado.boxes):
+        classe_origem = int(box.cls[0])
+        nome = str(nomes.get(classe_origem, classe_origem))
+        classe = classes_destino.get(_normalizar_classe(nome))
+        if classe is None:
+            continue
+        if task == 'segment':
+            pontos = None
+            if masks_xy is not None and i < len(masks_xy) and len(masks_xy[i]) >= 3:
+                pontos = [(min(max(float(x) / largura, 0.0), 1.0), min(max(float(y) / altura, 0.0), 1.0))
+                          for x, y in masks_xy[i]]
+            if pontos is None:
+                x1, y1, x2, y2 = (float(v) for v in box.xyxy[0].tolist())
+                pontos = [(x1 / largura, y1 / altura), (x2 / largura, y1 / altura),
+                          (x2 / largura, y2 / altura), (x1 / largura, y2 / altura)]
+            linhas.append(f'{classe} ' + ' '.join(f'{x:.6f} {y:.6f}' for x, y in pontos))
+        else:
+            xc, yc, w, h = (float(v) for v in box.xywhn[0].tolist())
+            linhas.append(f'{classe} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}')
+    return linhas
+
+
 class TestVideoState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -1254,7 +1288,9 @@ def _resolve_base_model(pp: ProjectPaths, modelo_base: str) -> str:
         return str(candidatos[0] / 'weights' / 'last.pt')
 
     task = load_project_task(pp)
-    if task == 'segment':
+    if task == 'classify':
+        permitidos = {'yolov8n-cls.pt', 'yolov8s-cls.pt', 'yolov8m-cls.pt'}
+    elif task == 'segment':
         permitidos = {'yolov8n-seg.pt', 'yolov8s-seg.pt', 'yolov8m-seg.pt'}
     else:
         permitidos = {'yolov8n.pt', 'yolov8s.pt', 'yolov8m.pt'}
@@ -1269,28 +1305,35 @@ def _run_training(pp: ProjectPaths, params: dict) -> None:
     run_name = datetime.now().strftime('treino_%Y%m%d_%H%M%S')
     run_dir = pp.runs / run_name
     try:
+        task = load_project_task(pp)
         classes = load_classes(pp)
+        if task == 'classify':
+            classes = sorted(d.name for d in (pp.classify_dataset / 'train').iterdir() if d.is_dir())
+            save_classes(pp, classes)
         if not classes:
             raise ValueError('Cadastre pelo menos uma classe antes de treinar.')
 
-        train_images = [p for ext in IMAGE_EXTENSIONS for p in pp.images_train.glob(ext)]
+        train_images = ([p for ext in IMAGE_EXTENSIONS for p in pp.images_train.glob(ext)] if task != 'classify'
+                        else [p for d in (pp.classify_dataset / 'train').iterdir() if d.is_dir()
+                              for ext in IMAGE_EXTENSIONS for p in d.glob(ext)])
         if not train_images:
             raise ValueError('Nao ha imagens anotadas em "Treino". Anote e salve pelo menos uma imagem.')
 
-        val_images = [p for ext in IMAGE_EXTENSIONS for p in pp.images_val.glob(ext)]
+        val_images = ([p for ext in IMAGE_EXTENSIONS for p in pp.images_val.glob(ext)] if task != 'classify'
+                      else [p for d in (pp.classify_dataset / 'valid').iterdir() if d.is_dir()
+                            for ext in IMAGE_EXTENSIONS for p in d.glob(ext)])
         val_subdir = 'images/val' if val_images else 'images/train'
         if not val_images:
             training_state.add_log('Aviso: sem imagens em "Validacao", usando as de treino tambem para validar.')
 
-        data = {
-            'path': str(pp.dataset.resolve()),
-            'train': 'images/train',
-            'val': val_subdir,
-            'names': {i: name for i, name in enumerate(classes)},
-        }
-        data_yaml_path = pp.dataset / 'data.yaml'
-        with open(data_yaml_path, 'w', encoding='utf-8') as fh:
-            yaml.safe_dump(data, fh, allow_unicode=True, sort_keys=False)
+        if task == 'classify':
+            data_yaml_path = pp.classify_dataset
+        else:
+            data = {'path': str(pp.dataset.resolve()), 'train': 'images/train',
+                    'val': val_subdir, 'names': {i: name for i, name in enumerate(classes)}}
+            data_yaml_path = pp.dataset / 'data.yaml'
+            with open(data_yaml_path, 'w', encoding='utf-8') as fh:
+                yaml.safe_dump(data, fh, allow_unicode=True, sort_keys=False)
 
         base_model = _resolve_base_model(pp, params['modelo_base'])
         training_state.add_log(f'Carregando modelo base: {base_model}')
@@ -1361,90 +1404,112 @@ PAGE_HTML = """
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Treinamento de Modelo - Contador IA (Varinha Magica)</title>
+  <title>Treinamento de Modelo</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <style>
+    /* Identidade "bancada de inspecao": aco claro, grafite e ambar de etiqueta.
+       O ambar e usado como preenchimento (com texto grafite por cima);
+       quando precisa ser texto sobre branco, usa --accent-ink (contraste AA). */
     :root {
-      --bg: #f5f5f7; --bg-elevated: #ffffff; --card: #ffffff; --border: #d2d2d7;
-      --fill: rgba(0,0,0,.045); --fill-strong: rgba(0,0,0,.07);
-      --text: #1d1d1f; --text-muted: #6e6e73; --text-faint: #86868b;
-      --accent: #0071e3; --accent-tint: rgba(0,113,227,.1); --accent-hover: #0077ed; --accent-press: #005fc0;
-      --ok: #22c55e; --err: #ef4444; --warn: #f59e0b; --neutral: #86868b;
-      --radius: 20px; --radius-md: 12px; --radius-sm: 8px;
-      --shadow-sm: 0 1px 2px rgba(0,0,0,.04), 0 1px 1px rgba(0,0,0,.03);
-      --shadow: 0 1px 2px rgba(0,0,0,.03), 0 10px 28px rgba(0,0,0,.06);
-      --shadow-lg: 0 24px 64px rgba(0,0,0,.16), 0 4px 14px rgba(0,0,0,.08);
+      --steel: #EEF1F4; --graphite: #1F2933; --graphite-2: #2B3742; --slate: #5B6875;
+      --amber: #E8A317; --amber-hover: #F0B232; --amber-press: #C98B0C; --amber-ink: #8A5A00;
+      --line: #CBD2D9; --line-soft: #DDE2E7;
+
+      --bg: var(--steel); --bg-elevated: #ffffff; --card: #ffffff; --border: var(--line);
+      --fill: #F3F5F7; --fill-strong: #E6EAEE;
+      --text: var(--graphite); --text-muted: var(--slate); --text-faint: #7B8794;
+      --accent: var(--amber); --accent-ink: var(--amber-ink); --accent-tint: rgba(232,163,23,.16);
+      --accent-hover: var(--amber-hover); --accent-press: var(--amber-press);
+      --ok: #2F9E5B; --err: #D64545; --warn: #D98B0B; --neutral: #9AA5B1;
+      --radius: 8px; --radius-md: 6px; --radius-sm: 4px;
+      --shadow-sm: 0 1px 0 rgba(31,41,51,.06);
+      --shadow: 0 1px 0 rgba(31,41,51,.06);
+      --shadow-lg: 0 18px 48px rgba(31,41,51,.28);
       --ease: cubic-bezier(.25,.1,.25,1);
     }
     * { box-sizing: border-box; }
     html { -webkit-tap-highlight-color: transparent; }
     body {
       margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
-      background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.47;
+      font-family: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+      background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.5;
       -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
-      letter-spacing: -.006em;
     }
     button, input, select { font-family: inherit; letter-spacing: inherit; }
-    ::selection { background: var(--accent); color: #fff; }
+    /* base dos campos sem classe propria (ex.: painel lateral do modal) */
+    select, input[type="number"], input[type="text"], input[type="password"] {
+      background: #fff; border: 1px solid var(--border); border-radius: var(--radius-sm);
+      padding: 7px 10px; font-size: 14px; color: var(--text);
+    }
+    select:focus, input[type="number"]:focus, input[type="text"]:focus, input[type="password"]:focus {
+      outline: none; border-color: var(--amber); box-shadow: 0 0 0 3px var(--accent-tint);
+    }
+    ::selection { background: var(--amber); color: var(--graphite); }
+    :focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { transition-duration: 0s !important; animation-duration: 0s !important; }
+    }
 
     .app-shell { display: flex; align-items: stretch; min-height: 100vh; }
     .sidebar {
-      flex: 0 0 220px; width: 220px; background: var(--bg-elevated); border-right: 1px solid var(--border);
-      display: flex; flex-direction: column; gap: 2px; padding: 22px 12px;
+      flex: 0 0 224px; width: 224px; background: var(--graphite); border-right: 1px solid #111820;
+      display: flex; flex-direction: column; gap: 2px; padding: 20px 0;
+      position: sticky; top: 0; height: 100vh;
     }
     .side-btn {
-      display: flex; align-items: center; gap: 10px;
-      background: none; border: none; color: var(--text-muted);
-      border-radius: 10px; padding: 9px 12px; text-align: left; cursor: pointer;
-      font-size: 13.5px; font-weight: 590; letter-spacing: -.006em;
+      display: flex; align-items: center; gap: 12px;
+      background: none; border: none; border-left: 3px solid transparent; color: #AEB8C2;
+      border-radius: 0; padding: 11px 18px 11px 17px; text-align: left; cursor: pointer;
+      font-size: 14px; font-weight: 500;
       transition: background-color .15s var(--ease), color .15s var(--ease);
     }
-    .side-btn svg { flex: 0 0 auto; width: 18px; height: 18px; opacity: .82; }
-    .side-btn:hover { color: var(--text); background: var(--fill); }
-    .side-btn.active { color: #fff; background: var(--accent); box-shadow: 0 1px 3px rgba(0,113,227,.35); }
-    .side-btn.active svg { opacity: 1; }
-    .side-btn:active { transform: scale(.98); }
+    .side-btn svg { flex: 0 0 auto; width: 18px; height: 18px; opacity: .8; }
+    .side-btn:hover { color: #fff; background: var(--graphite-2); }
+    .side-btn.active { color: #fff; background: var(--graphite-2); border-left-color: var(--amber); font-weight: 600; }
+    .side-btn.active svg { opacity: 1; color: var(--amber); }
+    .side-btn:focus-visible { outline-offset: -2px; }
     .app-main { flex: 1; min-width: 0; }
 
     header.topbar {
-      display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 28px;
-      background: rgba(255,255,255,.78); border-bottom: 1px solid var(--border); flex-wrap: wrap;
+      display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 28px;
+      background: #fff; border-bottom: 1px solid var(--border); flex-wrap: wrap;
       position: sticky; top: 0; z-index: 20;
-      -webkit-backdrop-filter: saturate(180%) blur(20px); backdrop-filter: saturate(180%) blur(20px);
     }
     header.topbar .brand { display: flex; align-items: baseline; gap: 12px; }
-    header.topbar h1 { font-size: 21px; font-weight: 650; letter-spacing: -.02em; margin: 0; }
-    header.topbar span { font-size: 12.5px; color: var(--text-muted); }
+    header.topbar h1 { font-size: 20px; font-weight: 600; letter-spacing: -.01em; margin: 0; }
+    header.topbar span { font-size: 13px; color: var(--text-muted); }
 
     .projeto-row { display: flex; align-items: center; gap: 10px; }
     .projeto-row select {
-      background: var(--fill); border: 1px solid transparent; color: var(--text);
-      border-radius: var(--radius-sm); padding: 8px 12px; font-size: 13px; min-width: 220px;
-      transition: background-color .15s var(--ease), border-color .15s var(--ease);
+      background: #fff; border: 1px solid var(--border); color: var(--text);
+      border-radius: var(--radius-sm); padding: 0 12px; height: 38px; font-size: 14px; font-weight: 500; min-width: 240px;
+      transition: border-color .15s var(--ease);
     }
-    .projeto-row select:hover { background: var(--fill-strong); }
-    .projeto-row select:focus { outline: none; background: #fff; border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-tint); }
+    .projeto-row select:hover { border-color: var(--slate); }
+    .projeto-row select:focus { outline: none; border-color: var(--amber); box-shadow: 0 0 0 3px var(--accent-tint); }
 
-    main.content { max-width: 1360px; margin: 0 auto; padding: 28px 28px 72px; display: flex; flex-direction: column; gap: 24px; }
+    main.content { max-width: 1360px; margin: 0 auto; padding: 24px 28px 72px; display: flex; flex-direction: column; gap: 20px; }
     .hr-soft { border: none; border-top: 1px solid var(--border); margin: 14px 0; width: 100%; }
     .tester-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-    @media (max-width: 720px) { .tester-grid { grid-template-columns: 1fr; } .sidebar { flex-basis: 72px; width: 72px; } .side-btn span.label-text { display: none; } }
+    @media (max-width: 720px) { .tester-grid { grid-template-columns: 1fr; } .sidebar { flex-basis: 60px; width: 60px; } .side-btn { justify-content: center; padding: 12px 0; } .side-btn span.label-text { display: none; } header.topbar { padding: 12px 16px; } main.content { padding: 16px 16px 72px; } .projeto-row select { min-width: 0; flex: 1; } .projeto-row { width: 100%; } header.topbar .brand { flex-wrap: wrap; } .card { padding: 16px; } .video-frame { min-width: 0; flex: 1 1 100%; } .capture-panel { flex: 1 1 100%; min-width: 0; } .modal { padding: 8px; } .modal-body { padding: 12px; } .modal-side { flex: 1 1 100%; } }
     .tester-grid img { max-width: 100%; border-radius: var(--radius-md); background: #000; display: block; }
     .card {
-      background: var(--card); border: 1px solid rgba(0,0,0,.04); border-radius: var(--radius);
-      padding: 26px; box-shadow: var(--shadow);
+      background: var(--card); border: 1px solid var(--line-soft); border-radius: var(--radius);
+      padding: 24px; box-shadow: var(--shadow);
     }
     .card h2 {
-      margin: 0 0 18px 0; font-size: 18px; font-weight: 600; letter-spacing: -.014em;
+      margin: 0 0 18px 0; font-size: 17px; font-weight: 600; letter-spacing: -.005em;
       color: var(--text);
     }
-    .card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
+    .card-header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px 16px; margin-bottom: 18px; }
     .card-header h2 { margin: 0; }
 
     .video-row { display: flex; gap: 22px; flex-wrap: wrap; align-items: flex-start; }
     .video-frame {
       position: relative; flex: 1 1 640px; min-width: 320px; max-width: 100%; border-radius: var(--radius-md);
-      overflow: hidden; background: #000; box-shadow: var(--shadow-sm); line-height: 0;
+      overflow: hidden; background: var(--graphite); box-shadow: var(--shadow-sm); line-height: 0; min-height: 240px;
     }
     .video-frame img { width: 100%; max-width: 100%; display: block; transition: width .12s linear; }
     .video-frame img.video-pausado { filter: grayscale(1); }
@@ -1455,7 +1520,7 @@ PAGE_HTML = """
     .video-pause-overlay svg { width: 56px; height: 56px; color: #fff; filter: drop-shadow(0 2px 8px rgba(0,0,0,.6)); }
     .capture-panel { display: flex; flex-direction: column; gap: 18px; flex: 0 0 240px; min-width: 220px; }
     .panel-block { display: flex; flex-direction: column; gap: 9px; }
-    .panel-label { font-size: 12px; font-weight: 600; color: var(--text-muted); }
+    .panel-label { font-size: 13px; font-weight: 600; color: var(--text); }
     .panel-divider { height: 1px; background: var(--border); }
     .btn-block { width: 100%; text-align: center; }
 
@@ -1467,52 +1532,54 @@ PAGE_HTML = """
     }
     input[type="range"]::-webkit-slider-thumb {
       -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%; margin-top: -7px;
-      background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.25), 0 0 0 1px rgba(0,0,0,.06); cursor: pointer;
+      background: #fff; border: 2px solid var(--graphite); box-shadow: none; cursor: pointer;
     }
     input[type="range"]::-moz-range-track { height: 4px; border-radius: 999px; background: transparent; }
     input[type="range"]::-moz-range-thumb {
-      width: 18px; height: 18px; border-radius: 50%; border: none;
-      background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.25), 0 0 0 1px rgba(0,0,0,.06); cursor: pointer;
+      width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--graphite);
+      background: #fff; cursor: pointer;
     }
 
     .file-picker {
       display: flex; align-items: center; justify-content: center; gap: 8px;
-      background: var(--fill); border: 1.5px dashed var(--border); border-radius: var(--radius-sm);
+      background: var(--fill); border: 1.5px dashed #9AA5B1; border-radius: var(--radius-sm);
       padding: 13px 10px; cursor: pointer; font-size: 12.5px; color: var(--text-muted); font-weight: 500;
       transition: background-color .15s var(--ease), border-color .15s var(--ease), color .15s var(--ease);
     }
-    .file-picker:hover { background: var(--fill-strong); border-color: var(--accent); color: var(--text); }
+    .file-picker:hover { background: var(--accent-tint); border-color: var(--amber); color: var(--text); }
     .file-picker svg { flex: 0 0 auto; width: 16px; height: 16px; }
-    .hint { font-size: 12.5px; color: var(--text-muted); }
+    .hint { font-size: 13px; color: var(--text-muted); }
     .hint.ok { color: var(--ok); }
     .hint.err { color: var(--err); }
 
     .btn-primary {
-      background: var(--accent); border: none; border-radius: 980px; padding: 10px 20px;
-      color: #fff; font-size: 13.5px; font-weight: 590; cursor: pointer;
-      transition: background-color .15s var(--ease), transform .1s var(--ease);
+      background: var(--amber); border: 1px solid var(--amber-press); border-radius: var(--radius-sm); padding: 9px 18px;
+      color: var(--graphite); font-size: 14px; font-weight: 600; cursor: pointer;
+      transition: background-color .15s var(--ease);
     }
-    .btn-primary:hover { background: var(--accent-hover); }
-    .btn-primary:active { background: var(--accent-press); transform: scale(.97); }
-    .btn-primary:disabled { background: var(--neutral); cursor: not-allowed; transform: none; }
+    .btn-primary:hover { background: var(--amber-hover); }
+    .btn-primary:active { background: var(--amber-press); }
+    .btn-primary:disabled { background: var(--fill-strong); border-color: var(--line); color: var(--text-faint); cursor: not-allowed; }
     .btn-secondary {
-      background: var(--fill); border: none; border-radius: 980px; padding: 9px 18px;
-      color: var(--text); font-size: 13.5px; font-weight: 590; cursor: pointer;
-      transition: background-color .15s var(--ease), transform .1s var(--ease);
+      background: #fff; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 16px;
+      color: var(--text); font-size: 14px; font-weight: 500; cursor: pointer;
+      transition: background-color .15s var(--ease), border-color .15s var(--ease);
     }
-    .btn-secondary:hover { background: var(--fill-strong); }
-    .btn-secondary:active { transform: scale(.97); }
+    .btn-secondary:hover { background: var(--fill); border-color: var(--slate); }
+    .btn-secondary:active { background: var(--fill-strong); }
+    .btn-secondary:disabled { color: var(--text-faint); cursor: not-allowed; }
 
+    /* Classes como etiquetas: faixa de cor da classe a esquerda */
     .chip-list { display: flex; flex-wrap: wrap; gap: 8px; }
     .chip-select {
-      border: 1px solid transparent; background: var(--fill); color: var(--text);
-      border-radius: 999px; padding: 6px 14px; font-size: 12.5px; font-weight: 500; cursor: pointer;
-      border-left: 4px solid var(--chip-color, var(--accent));
-      transition: background-color .15s var(--ease), transform .1s var(--ease);
+      border: 1px solid var(--border); background: #fff; color: var(--text);
+      border-radius: var(--radius-sm); padding: 6px 12px 6px 10px; font-size: 13px; font-weight: 500; cursor: pointer;
+      border-left: 5px solid var(--chip-color, var(--accent));
+      transition: background-color .15s var(--ease), border-color .15s var(--ease);
     }
-    .chip-select:hover { background: var(--fill-strong); }
-    .chip-select:active { transform: scale(.96); }
-    .chip-select.active { background: var(--accent-tint); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+    .chip-select:hover { background: var(--fill); }
+    .chip-select.active { background: var(--graphite); border-color: var(--graphite); border-left-color: var(--chip-color, var(--accent)); color: #fff; font-weight: 600; }
+    .chip-select.active small { color: #AEB8C2 !important; }
     /* classes do modelo: botao da classe + editar / remover */
     .chip-classe { display: inline-flex; align-items: center; gap: 2px; }
     .chip-classe .chip-select small { font-weight: 400; color: var(--text-muted); margin-left: 6px; font-variant-numeric: tabular-nums; }
@@ -1525,34 +1592,47 @@ PAGE_HTML = """
 
     .inline-form { display: flex; gap: 8px; margin-top: 14px; }
     .inline-form input {
-      flex: 1; max-width: 260px; background: var(--fill); border: 1px solid transparent;
+      flex: 1; max-width: 260px; background: #fff; border: 1px solid var(--border);
       border-radius: var(--radius-sm); padding: 9px 13px; color: var(--text); font-size: 13.5px;
       transition: background-color .15s var(--ease), border-color .15s var(--ease);
     }
-    .inline-form input:focus { outline: none; background: #fff; border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-tint); }
+    .inline-form input:focus { outline: none; background: #fff; border-color: var(--amber); box-shadow: 0 0 0 3px var(--accent-tint); }
     .inline-form button {
-      background: var(--fill); border: none; border-radius: var(--radius-sm);
-      padding: 9px 16px; color: var(--text); font-size: 13.5px; font-weight: 590; cursor: pointer;
+      background: #fff; border: 1px solid var(--border); border-radius: var(--radius-sm);
+      padding: 9px 16px; color: var(--text); font-size: 13.5px; font-weight: 500; cursor: pointer;
       transition: background-color .15s var(--ease), transform .1s var(--ease);
     }
     .inline-form button:hover { background: var(--fill-strong); }
     .inline-form button:active { transform: scale(.97); }
 
-    .tabs { display: inline-flex; gap: 2px; background: var(--fill); border-radius: 10px; padding: 3px; }
+    .tabs { display: inline-flex; gap: 0; border-bottom: 1px solid var(--border); }
     .tab-btn {
-      background: transparent; border: 1px solid transparent; color: var(--text-muted);
-      border-radius: 8px; padding: 6px 14px; font-size: 12.5px; font-weight: 590; cursor: pointer;
-      transition: background-color .18s var(--ease), color .18s var(--ease), box-shadow .18s var(--ease);
+      background: transparent; border: none; border-bottom: 3px solid transparent; color: var(--text-muted);
+      border-radius: 0; padding: 8px 16px 7px; margin-bottom: -1px; font-size: 14px; font-weight: 500; cursor: pointer;
+      transition: color .15s var(--ease), border-color .15s var(--ease);
     }
-    .tab-btn.active { background: #fff; color: var(--text); border-color: transparent; box-shadow: 0 1px 4px rgba(0,0,0,.12); }
+    .tab-btn:hover { color: var(--text); }
+    .tab-btn.active { color: var(--text); font-weight: 600; border-bottom-color: var(--amber); }
 
     .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 14px; }
+    .gallery-pagination { display: flex; align-items: center; justify-content: center; gap: 6px; flex-wrap: wrap; margin-top: 18px; }
+    .gallery-pagination button { min-width: 34px; height: 32px; padding: 0 9px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: #fff; color: var(--text); cursor: pointer; font-size: 13px; }
+    .gallery-pagination button:hover:not(:disabled) { background: var(--fill-strong); }
+    .gallery-pagination button.active { background: var(--graphite); border-color: var(--graphite); color: #fff; }
+    .gallery-pagination button:disabled { cursor: default; opacity: .45; }
+    .gallery-pagination .pagination-info { color: var(--text-muted); font-size: 12.5px; margin: 0 5px; }
+    .lote-preview-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px; }
+    .lote-preview { overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--fill); }
+    .lote-preview img { display: block; width: 100%; height: 160px; object-fit: contain; background: #111; cursor: zoom-in; }
+    .lote-preview-info { display: flex; justify-content: space-between; gap: 8px; padding: 9px 10px; font-size: 12px; color: var(--text-muted); }
+    .lote-preview-info span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .lote-popup-image { display: block; max-width: 94vw; max-height: 82vh; width: auto; height: auto; margin: 0 auto; background: #111; }
     .thumb {
-      background: var(--fill); border: 1px solid rgba(0,0,0,.04); border-radius: var(--radius-md);
-      overflow: hidden; position: relative; box-shadow: var(--shadow-sm);
-      transition: transform .18s var(--ease), box-shadow .18s var(--ease);
+      background: #fff; border: 1px solid var(--line); border-radius: var(--radius-md);
+      overflow: hidden; position: relative;
+      transition: border-color .15s var(--ease);
     }
-    .thumb:hover { transform: translateY(-3px); box-shadow: 0 10px 24px rgba(0,0,0,.12); }
+    .thumb:hover { border-color: var(--slate); }
     .thumb img { width: 100%; height: 110px; object-fit: cover; display: block; background: #000; }
     .thumb-badge {
       position: absolute; top: 8px; right: 8px; font-size: 10px; font-weight: 700;
@@ -1562,7 +1642,7 @@ PAGE_HTML = """
     .thumb-badge.ok { color: #6bf29a; }
     .thumb-badge.warn { color: #ffc257; }
     .thumb-badge.pre { color: #8ec5ff; }
-    .boxes-list li.sel { background: var(--accent-tint); border-radius: 6px; }
+    .boxes-list li.sel { background: var(--accent-tint); box-shadow: inset 3px 0 0 var(--amber); border-radius: var(--radius-sm); }
     .boxes-list li { padding: 3px 6px; cursor: pointer; }
     .boxes-list select { font: inherit; font-size: 12px; padding: 2px 4px; border-radius: 6px; border: 1px solid var(--border); background: var(--fill); color: var(--text); max-width: 170px; }
     .thumb-classes {
@@ -1573,16 +1653,16 @@ PAGE_HTML = """
     .thumb-dot { width: 8px; height: 8px; border-radius: 50%; box-shadow: 0 0 0 1px rgba(255,255,255,.5); }
     .thumb-actions { display: flex; flex-direction: column; gap: 5px; padding: 9px; }
     .thumb-btn {
-      background: #fff; border: 1px solid rgba(0,0,0,.06); color: var(--text);
-      border-radius: var(--radius-sm); padding: 6px 8px; font-size: 11px; font-weight: 500; cursor: pointer;
+      background: #fff; border: 1px solid var(--line); color: var(--text);
+      border-radius: var(--radius-sm); padding: 6px 8px; font-size: 12px; font-weight: 500; cursor: pointer;
       transition: background-color .15s var(--ease), color .15s var(--ease), border-color .15s var(--ease);
     }
-    .thumb-btn:hover { background: var(--accent-tint); border-color: var(--accent); color: var(--accent); }
+    .thumb-btn:hover { background: var(--accent-tint); border-color: var(--amber); color: var(--accent-ink); }
     .thumb-btn.danger:hover { background: rgba(239,68,68,.1); border-color: var(--err); color: var(--err); }
 
     .thumb.selecionavel { cursor: pointer; }
     .thumb.selecionavel img { user-select: none; -webkit-user-select: none; }
-    .thumb.selecionado { box-shadow: 0 0 0 3px var(--accent); }
+    .thumb.selecionado { border-color: var(--amber); box-shadow: 0 0 0 2px var(--amber); }
     .thumb.selecionado img { opacity: .82; }
     .thumb-select-dot {
       position: absolute; top: 8px; left: 8px; width: 22px; height: 22px; border-radius: 50%;
@@ -1592,7 +1672,8 @@ PAGE_HTML = """
       transition: background-color .15s var(--ease), border-color .15s var(--ease);
     }
     .thumb-select-dot svg { width: 13px; height: 13px; color: #fff; opacity: 0; transition: opacity .12s var(--ease); }
-    .thumb.selecionado .thumb-select-dot { background: var(--accent); border-color: var(--accent); }
+    .thumb.selecionado .thumb-select-dot { background: var(--amber); border-color: var(--amber); }
+    .thumb.selecionado .thumb-select-dot svg { color: var(--graphite); }
     .thumb.selecionado .thumb-select-dot svg { opacity: 1; }
 
     .selecao-barra {
@@ -1611,17 +1692,17 @@ PAGE_HTML = """
       display: flex; flex-direction: column; gap: 6px; font-size: 12px; font-weight: 500; color: var(--text-muted);
     }
     .training-form input, .training-form select {
-      background: var(--fill); border: 1px solid transparent; border-radius: var(--radius-sm);
+      background: #fff; border: 1px solid var(--border); border-radius: var(--radius-sm);
       padding: 9px 11px; color: var(--text); font-size: 13.5px; min-width: 140px;
       transition: background-color .15s var(--ease), border-color .15s var(--ease);
     }
     .training-form input:focus, .training-form select:focus {
-      outline: none; background: #fff; border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-tint);
+      outline: none; background: #fff; border-color: var(--amber); box-shadow: 0 0 0 3px var(--accent-tint);
     }
 
     .training-progress { margin-top: 20px; }
     .progress-bar { background: var(--fill); border-radius: 999px; height: 8px; overflow: hidden; }
-    .progress-fill { height: 100%; width: 0%; background: var(--accent); transition: width .4s var(--ease); }
+    .progress-fill { height: 100%; width: 0%; background: var(--amber); transition: width .4s var(--ease); }
     #progress-text { margin-top: 10px; font-size: 12.5px; color: var(--text-muted); font-weight: 500; }
     .metrics-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
     .metric-pill {
@@ -1642,9 +1723,9 @@ PAGE_HTML = """
     .tempos-lista span.lenta b { color: #d97706; }
     .tempos-titulo { font-size: 11.5px; font-weight: 600; color: var(--text-muted); margin-top: 10px; }
     .log-box {
-      margin-top: 12px; background: #1d1d1f; border-radius: var(--radius-md);
+      margin-top: 12px; background: var(--graphite); border-radius: var(--radius-md);
       padding: 14px; font-size: 11.5px; color: #c8c8cd; max-height: 180px; overflow-y: auto;
-      white-space: pre-wrap; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      white-space: pre-wrap; font-family: "IBM Plex Mono", ui-monospace, Consolas, monospace;
     }
 
     /* ================= Treinamento (layout em cartoes) ================= */
@@ -1653,7 +1734,7 @@ PAGE_HTML = """
     .tr-cab h2 { margin: 0; font-size: 17px; white-space: nowrap; }
     .tr-cab h2 small { font-size: 14px; font-weight: 600; color: var(--text-muted); margin-left: 4px; }
     .tr-cab .tr-dir { margin-left: auto; font-size: 12.5px; color: var(--text-muted); }
-    .tr-ico { display: inline-flex; width: 22px; height: 22px; color: var(--c, var(--accent)); flex: 0 0 22px; }
+    .tr-ico { display: inline-flex; width: 22px; height: 22px; color: var(--c, var(--slate)); flex: 0 0 22px; }
     .tr-ico svg, .tr-btn-iniciar svg, .tr-btn-mini svg, .tr-stat svg, .tr-tile-ico svg { width: 100%; height: 100%; }
 
     .tr-form { display: grid; grid-template-columns: repeat(4, minmax(110px, 1fr)) minmax(220px, 2fr) auto; gap: 14px; align-items: end; }
@@ -1663,16 +1744,16 @@ PAGE_HTML = """
       padding: 0 12px; color: var(--text); font-size: 14px; width: 100%;
       transition: border-color .15s var(--ease), box-shadow .15s var(--ease);
     }
-    .tr-form input:focus, .tr-form select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-tint); }
+    .tr-form input:focus, .tr-form select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-tint); }
     .tr-btn-iniciar {
-      height: 52px; padding: 0 26px; border: 0; border-radius: var(--radius-md); background: #16a34a; color: #fff;
+      height: 52px; padding: 0 26px; border: 0; border-radius: var(--radius-sm); background: var(--amber); color: var(--graphite); border: 1px solid var(--amber-press);
       font-size: 15px; font-weight: 600; display: inline-flex; align-items: center; gap: 10px; cursor: pointer;
-      box-shadow: 0 4px 14px rgba(22,163,74,.3); transition: background-color .15s var(--ease), transform .1s var(--ease);
+      box-shadow: none; transition: background-color .15s var(--ease), transform .1s var(--ease);
     }
     .tr-btn-iniciar svg { width: 18px; height: 18px; }
-    .tr-btn-iniciar:hover { background: #15803d; }
+    .tr-btn-iniciar:hover { background: var(--amber-hover); }
     .tr-btn-iniciar:active { transform: scale(.98); }
-    .tr-btn-iniciar:disabled { background: #9ca3af; box-shadow: none; cursor: not-allowed; }
+    .tr-btn-iniciar:disabled { background: var(--fill-strong); border-color: var(--line); color: var(--text-faint); cursor: not-allowed; }
     .tr-dica { display: flex; gap: 8px; align-items: flex-start; margin-top: 14px; font-size: 12.5px; color: var(--text-muted); }
     .tr-dica .tr-ico { width: 16px; height: 16px; flex-basis: 16px; margin-top: 1px; }
     #ambiente-info { margin-top: 6px; padding-left: 24px; }
@@ -1687,10 +1768,10 @@ PAGE_HTML = """
 
     .tr-epoca { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 10px; }
     .tr-epoca b { font-size: 19px; font-weight: 600; }
-    .tr-epoca span { font-size: 30px; font-weight: 700; color: var(--accent); font-variant-numeric: tabular-nums; }
+    .tr-epoca span { font-size: 30px; font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; }
     .tr-barra { height: 12px; background: var(--fill-strong); border-radius: 999px; overflow: hidden; }
-    .tr-barra i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 999px; transition: width .5s var(--ease); }
-    .tr-barra.ok i { background: #16a34a; }
+    .tr-barra i { display: block; height: 100%; width: 0; background: var(--amber); border-radius: 999px; transition: width .5s var(--ease); }
+    .tr-barra.ok i { background: var(--ok); }
     .tr-barra.erro i { background: var(--err, #dc2626); }
     .tr-msg { margin-top: 12px; font-size: 13px; border-radius: var(--radius-sm); padding: 8px 12px; }
     .tr-msg.ok { background: rgba(22,163,74,.1); color: #166534; }
@@ -1713,9 +1794,9 @@ PAGE_HTML = """
     .tr-tile b { display: block; font-size: 17px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text); }
     .tr-vazio { color: var(--text-muted); font-size: 13px; padding: 18px 0; text-align: center; }
 
-    .tr-seg { margin-left: auto; display: inline-flex; background: var(--fill); border-radius: 999px; padding: 3px; }
-    .tr-seg button { border: 0; background: none; border-radius: 999px; padding: 5px 14px; font-size: 12.5px; font-weight: 500; color: var(--text-muted); cursor: pointer; }
-    .tr-seg button.ativo { background: #fff; color: var(--text); box-shadow: var(--shadow-sm); }
+    .tr-seg { margin-left: auto; display: inline-flex; background: var(--fill); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 2px; }
+    .tr-seg button { border: 0; background: none; border-radius: 3px; padding: 5px 14px; font-size: 12.5px; font-weight: 500; color: var(--text-muted); cursor: pointer; }
+    .tr-seg button.ativo { background: var(--graphite); color: #fff; }
     .tr-legenda { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12.5px; color: var(--text-muted); margin-bottom: 6px; }
     .tr-legenda span { display: inline-flex; align-items: center; gap: 6px; }
     .tr-legenda i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
@@ -1723,7 +1804,7 @@ PAGE_HTML = """
     .tr-graf-area svg { display: block; width: 100%; }
     .tr-graf-area .eixo { font-size: 11px; fill: var(--text-muted); }
     .tr-dica-graf {
-      position: absolute; pointer-events: none; background: #1d1d1f; color: #fff; border-radius: 8px; padding: 8px 10px;
+      position: absolute; pointer-events: none; background: var(--graphite); color: #fff; border-radius: var(--radius-sm); padding: 8px 10px;
       font-size: 12px; line-height: 1.55; white-space: nowrap; z-index: 3; box-shadow: var(--shadow);
     }
     .tr-dica-graf i { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
@@ -1743,7 +1824,7 @@ PAGE_HTML = """
     .tr-ep.lenta { border-color: rgba(217,119,6,.45); background: rgba(217,119,6,.06); }
     .tr-ep.lenta b { color: #b45309; }
 
-    .tr-log { background: #15171c; border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
+    .tr-log { background: var(--graphite); border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
     .tr-log-cab { display: flex; align-items: center; gap: 10px; padding: 14px 18px; border-bottom: 1px solid rgba(255,255,255,.08); color: #f3f4f6; }
     .tr-log-cab h2 { margin: 0; font-size: 15px; font-weight: 600; color: #f3f4f6; }
     .tr-log-cab .tr-ico { color: #f3f4f6; width: 18px; height: 18px; flex-basis: 18px; }
@@ -1758,10 +1839,10 @@ PAGE_HTML = """
     .tr-switch input { display: none; }
     .tr-switch i { width: 34px; height: 20px; border-radius: 999px; background: #4b5563; position: relative; transition: background-color .15s; }
     .tr-switch i::after { content: ""; position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: transform .15s; }
-    .tr-switch input:checked + i { background: var(--accent); }
+    .tr-switch input:checked + i { background: var(--amber); }
     .tr-switch input:checked + i::after { transform: translateX(14px); }
     .tr-log-corpo {
-      max-height: 260px; overflow-y: auto; padding: 12px 18px; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      max-height: 260px; overflow-y: auto; padding: 12px 18px; font-family: "IBM Plex Mono", ui-monospace, Consolas, monospace;
       font-size: 12px; line-height: 1.7; color: #d1d5db;
     }
     .tr-log-corpo div { white-space: pre-wrap; word-break: break-word; }
@@ -1774,7 +1855,7 @@ PAGE_HTML = """
     .tr-log-vazio { color: #6b7280; }
 
     .results-list { display: flex; flex-direction: column; gap: 14px; }
-    .result-card { background: var(--fill); border-radius: var(--radius-md); padding: 16px; }
+    .result-card { background: #fff; border: 1px solid var(--line); border-radius: var(--radius-md); padding: 16px; }
     .result-header { display: flex; justify-content: space-between; margin-bottom: 10px; }
     .result-header strong { font-weight: 600; }
     .result-images { display: flex; gap: 8px; overflow-x: auto; margin-bottom: 12px; }
@@ -1782,11 +1863,11 @@ PAGE_HTML = """
 
     .camera-list { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; }
     .camera-row {
-      display: flex; align-items: center; gap: 12px; background: var(--fill);
+      display: flex; align-items: center; gap: 12px; background: #fff; box-shadow: inset 0 0 0 1px var(--line-soft);
       border-radius: var(--radius-md); padding: 13px 16px;
       transition: background-color .15s var(--ease);
     }
-    .camera-row.ativa { background: var(--accent-tint); box-shadow: inset 0 0 0 1px rgba(0,113,227,.25); }
+    .camera-row.ativa { background: #fff; box-shadow: inset 4px 0 0 var(--amber), inset 0 0 0 1px var(--line); }
     .camera-dot {
       width: 9px; height: 9px; border-radius: 50%; background: var(--neutral); flex: 0 0 auto;
       box-shadow: 0 0 0 3px rgba(134,134,139,.15);
@@ -1797,20 +1878,19 @@ PAGE_HTML = """
     .camera-info strong { font-size: 13.5px; font-weight: 600; }
     .camera-info span { font-size: 11.5px; color: var(--text-muted); }
     .camera-badge-ativa {
-      font-size: 10.5px; font-weight: 700; letter-spacing: .02em; color: var(--accent);
-      background: rgba(0,113,227,.14); border: none;
-      border-radius: 999px; padding: 4px 11px; flex: 0 0 auto;
+      font-size: 10.5px; font-weight: 700; letter-spacing: .02em; color: var(--graphite);
+      background: var(--amber); border: none;
+      border-radius: var(--radius-sm); padding: 4px 11px; flex: 0 0 auto;
     }
     .camera-actions { display: flex; gap: 8px; flex: 0 0 auto; }
     .camera-actions button { white-space: nowrap; }
 
     .modal {
-      position: fixed; inset: 0; background: rgba(0,0,0,.42); display: none;
+      position: fixed; inset: 0; background: rgba(17,24,32,.6); display: none;
       align-items: center; justify-content: center; z-index: 100; padding: 20px;
-      -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
     }
     .modal-box {
-      background: var(--card); border: none; border-radius: 24px;
+      background: var(--card); border: none; border-radius: 10px;
       max-width: 1100px; width: 100%; max-height: 92vh; overflow-y: auto; box-shadow: var(--shadow-lg);
     }
     .modal-header {
@@ -1824,17 +1904,57 @@ PAGE_HTML = """
       display: flex; align-items: center; justify-content: center; gap: 10px;
       height: min(70vh, 640px);
     }
+    /* Janela de anotacao: ferramentas | imagem | marcacoes, tudo na altura da tela
+       (cada painel rola sozinho, a imagem fica sempre visivel ao lado da lista). */
+    #modal-anotacao .modal-box {
+      max-width: 1500px; width: 97vw; height: 94vh; max-height: 94vh; overflow: hidden;
+      display: flex; flex-direction: column;
+    }
+    #modal-anotacao .modal-header { padding: 12px 18px; flex: 0 0 auto; }
+    #modal-anotacao .modal-body {
+      flex: 1 1 auto; min-height: 0; padding: 0; gap: 0; flex-wrap: nowrap;
+      display: grid; grid-template-columns: 250px minmax(0, 1fr) 270px;
+    }
+    #modal-anotacao .modal-tools, #modal-anotacao .modal-side {
+      min-height: 0; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 8px;
+    }
+    #modal-anotacao .modal-tools { grid-column: 1; grid-row: 1; border-right: 1px solid var(--line-soft); }
+    #modal-anotacao .modal-side { grid-column: 3; grid-row: 1; border-left: 1px solid var(--line-soft); flex: initial; }
+    #modal-anotacao .canvas-wrap { grid-column: 2; grid-row: 1; min-width: 0; min-height: 0; padding: 12px; background: var(--fill); display: flex; }
+    #modal-anotacao .canvas-nav-row { height: 100%; width: 100%; }
+    #modal-anotacao .boxes-list { flex: 1 1 auto; min-height: 60px; overflow-y: auto; }
+    .modal-salvar { flex: 0 0 auto; border-top: 1px solid var(--line-soft); padding-top: 4px; display: flex; flex-direction: column; gap: 8px; }
+    .modal-tools h3 { font-size: 13px; color: var(--text); font-weight: 600; margin: 14px 0 6px; padding-top: 12px; border-top: 1px solid var(--line-soft); }
+    .modal-tools h3:first-child { border-top: 0; padding-top: 0; margin-top: 0; }
+    .modal-tools .radio-row { flex-direction: column; gap: 6px; margin-top: 8px; }
+    .boxes-list li.hover { background: var(--fill-strong); }
+    .boxes-list li .num { font-variant-numeric: tabular-nums; font-weight: 600; min-width: 18px; color: var(--text-muted); }
+    @media (max-width: 1100px) {
+      #modal-anotacao .modal-body { grid-template-columns: minmax(0, 1fr) 260px; grid-template-rows: minmax(0, 1fr) auto; }
+      #modal-anotacao .modal-tools { grid-column: 1; grid-row: 2; max-height: 34vh; border-right: 0; border-top: 1px solid var(--line-soft); }
+      #modal-anotacao .modal-side { grid-row: 1 / span 2; grid-column: 2; }
+      #modal-anotacao .canvas-wrap { grid-column: 1; grid-row: 1; }
+    }
+    @media (max-width: 720px) {
+      #modal-anotacao .modal-body { display: flex; flex-direction: column; overflow-y: auto; }
+      #modal-anotacao .canvas-wrap { flex: 0 0 auto; height: 55vh; }
+      #modal-anotacao .modal-tools, #modal-anotacao .modal-side { overflow: visible; max-height: none; border: 0; }
+    }
     .nav-arrow { flex: 0 0 auto; width: 34px; height: 34px; font-size: 18px; border-radius: 999px; }
     .nav-arrow:disabled { opacity: .3; cursor: not-allowed; }
     #anotacao-canvas { flex: 0 1 auto; min-width: 0; max-width: 100%; max-height: 100%; border-radius: var(--radius-md); background: #000; cursor: crosshair; }
     .modal-side { flex: 0 0 260px; display: flex; flex-direction: column; gap: 6px; }
-    .modal-side h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-muted); font-weight: 700; margin: 12px 0 6px; }
+    .modal-side h3 { font-size: 13px; color: var(--text); font-weight: 600; margin: 14px 0 6px; padding-top: 12px; border-top: 1px solid var(--line-soft); }
+    .modal-side h3:first-child { border-top: 0; padding-top: 0; margin-top: 0; }
     .boxes-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
     .boxes-list li { font-size: 12.5px; display: flex; align-items: center; gap: 6px; }
-    .link-btn-sm { background: none; border: none; color: var(--accent); font-size: 11.5px; font-weight: 500; cursor: pointer; margin-left: auto; }
-    .radio-row { display: flex; gap: 14px; font-size: 12.5px; }
+    .link-btn-sm { background: none; border: none; color: var(--accent-ink); text-decoration: underline; text-underline-offset: 2px; font-size: 11.5px; font-weight: 500; cursor: pointer; margin-left: auto; }
+    .radio-row { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13px; }
+    .radio-row label { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; cursor: pointer; }
+    .radio-row input { margin: 0; }
+    input[type="radio"], input[type="checkbox"] { accent-color: var(--graphite); }
     .icon-btn {
-      background: var(--fill); border: none; color: var(--text-muted);
+      background: #fff; border: 1px solid var(--border); color: var(--text-muted);
       border-radius: var(--radius-sm); width: 30px; height: 30px; cursor: pointer; font-size: 16px; line-height: 1;
       transition: background-color .15s var(--ease), color .15s var(--ease), transform .1s var(--ease);
     }
@@ -1844,32 +1964,32 @@ PAGE_HTML = """
       display: flex; flex-direction: column; gap: 6px; font-size: 12px; font-weight: 500; color: var(--text-muted); width: 100%;
     }
     .field-label input {
-      background: var(--fill); border: 1px solid transparent; border-radius: var(--radius-sm);
+      background: #fff; border: 1px solid var(--border); border-radius: var(--radius-sm);
       padding: 9px 13px; color: var(--text); font-size: 13.5px;
       transition: background-color .15s var(--ease), border-color .15s var(--ease);
     }
-    .field-label input:focus { outline: none; background: #fff; border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-tint); }
+    .field-label input:focus { outline: none; background: #fff; border-color: var(--amber); box-shadow: 0 0 0 3px var(--accent-tint); }
 
     /* ---- pagina Modelos ---- */
     .modelos-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); gap: 16px; }
     .modelo-card {
-      background: var(--fill); border-radius: var(--radius-md); padding: 18px;
-      cursor: pointer; transition: transform .18s var(--ease), box-shadow .18s var(--ease);
+      background: #fff; border: 1px solid var(--line); border-radius: var(--radius); padding: 18px;
+      cursor: pointer; transition: border-color .15s var(--ease), box-shadow .15s var(--ease);
       display: flex; flex-direction: column; gap: 12px;
     }
-    .modelo-card:hover { transform: translateY(-2px); box-shadow: var(--shadow); }
+    .modelo-card:hover { border-color: var(--slate); box-shadow: inset 0 3px 0 var(--amber); }
     .modelo-card-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
-    .modelo-card-header strong { font-size: 15px; font-weight: 650; letter-spacing: -.01em; line-height: 1.3; }
+    .modelo-card-header strong { font-size: 15px; font-weight: 600; letter-spacing: -.01em; line-height: 1.3; }
     .modelo-badge {
       font-size: 10.5px; font-weight: 700; letter-spacing: .02em; padding: 3px 9px; border-radius: 999px;
       white-space: nowrap; flex: 0 0 auto;
     }
-    .modelo-badge.detect { background: rgba(0,113,227,.1); color: var(--accent); }
+    .modelo-badge.detect { background: var(--accent-tint); color: var(--accent-ink); }
     .modelo-badge.segment { background: rgba(168,85,247,.12); color: #a855f7; }
     .modelo-stats-mini { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
-    .modelo-stat-mini { text-align: center; background: rgba(0,0,0,.03); border-radius: var(--radius-sm); padding: 8px 4px; }
-    .modelo-stat-mini strong { display: block; font-size: 16px; font-weight: 650; }
-    .modelo-stat-mini span { font-size: 10px; color: var(--text-muted); }
+    .modelo-stat-mini { text-align: center; background: var(--fill); border-radius: var(--radius-sm); padding: 8px 4px; }
+    .modelo-stat-mini strong { display: block; font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .modelo-stat-mini span { font-size: 11.5px; color: var(--text-muted); }
     .modelo-card-footer {
       display: flex; align-items: center; justify-content: space-between; gap: 8px;
       margin-top: auto; padding-top: 10px; border-top: 1px solid var(--border);
@@ -1887,14 +2007,14 @@ PAGE_HTML = """
 
     .detalhe-topo { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 18px; }
     .detalhe-titulo-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-    .detalhe-titulo-row h2 { margin: 0; font-size: 22px; font-weight: 650; letter-spacing: -.015em; }
+    .detalhe-titulo-row h2 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -.015em; }
     .detalhe-layout { display: flex; gap: 20px; align-items: flex-start; flex-wrap: wrap; }
     .detalhe-main { flex: 1 1 560px; min-width: 0; display: flex; flex-direction: column; gap: 18px; }
     .stat-panel { flex: 0 0 300px; min-width: 260px; display: flex; flex-direction: column; gap: 14px; }
-    .stat-group { background: var(--fill); border-radius: var(--radius-md); overflow: hidden; }
+    .stat-group { background: #fff; border: 1px solid var(--line); border-radius: var(--radius-md); overflow: hidden; }
     .stat-group-header {
-      background: rgba(0,0,0,.055); padding: 9px 14px; font-size: 10.5px; font-weight: 700;
-      letter-spacing: .06em; text-transform: uppercase; color: var(--text-muted);
+      background: var(--fill-strong); padding: 9px 14px; font-size: 13px; font-weight: 600;
+      color: var(--text);
     }
     .stat-grid-2 { display: grid; grid-template-columns: 1fr 1fr; padding: 4px 6px 10px; }
     .stat-cell { display: flex; justify-content: space-between; align-items: baseline; padding: 6px 8px; font-size: 12.5px; gap: 6px; }
@@ -1906,17 +2026,17 @@ PAGE_HTML = """
     .stat-row .stat-label { flex: 1 1 auto; color: var(--text); }
     .stat-row .stat-value { font-weight: 600; }
 
-    .run-card { background: var(--fill); border-radius: var(--radius-md); padding: 16px; }
+    .run-card { background: #fff; border: 1px solid var(--line); border-radius: var(--radius-md); padding: 16px; }
     .run-card-header { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
     .run-card-header strong { font-size: 14px; font-weight: 600; }
     .run-metric-pills { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
-    .run-metric-pill { font-size: 11px; font-weight: 600; background: rgba(0,113,227,.08); color: var(--accent); border-radius: 999px; padding: 3px 10px; }
+    .run-metric-pill { font-size: 11px; font-weight: 600; background: var(--accent-tint); color: var(--accent-ink); border-radius: var(--radius-sm); padding: 3px 10px; }
     .run-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; }
     .run-gallery img {
       width: 100%; height: 90px; object-fit: cover; border-radius: var(--radius-sm); cursor: pointer;
       background: #000; display: block; transition: transform .15s var(--ease), box-shadow .15s var(--ease);
     }
-    .run-gallery img:hover { transform: translateY(-2px); box-shadow: var(--shadow-sm); }
+    .run-gallery img:hover { outline: 2px solid var(--amber); }
 
     .lightbox-box { max-width: 1240px; width: 96vw; }
     .lightbox-body { display: flex; gap: 0; padding: 0; flex-wrap: nowrap; }
@@ -1956,6 +2076,14 @@ PAGE_HTML = """
       <button type="button" class="side-btn" data-view="testador">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6M10 3v5.2L5.6 16a2 2 0 0 0 1.7 3h9.4a2 2 0 0 0 1.7-3L14 8.2V3"/><path d="M7.5 14h9"/></svg>
         <span class="label-text">Testador IA</span>
+      </button>
+      <button type="button" class="side-btn" data-view="lote">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="5" width="11" height="14" rx="1.5"/><path d="M9 9h8.5a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H9"/><path d="m12 14 2 2 4-5"/></svg>
+        <span class="label-text">Carregamento em Lote</span>
+      </button>
+      <button type="button" class="side-btn" data-view="classificacao">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5.5h6l1.5 2H20v11H4z"/><path d="M8 13h8M12 9v8"/></svg>
+        <span class="label-text">Dataset por pastas</span>
       </button>
       <button type="button" class="side-btn" data-view="modelos">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="3.5" width="7" height="7" rx="1.3"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.3"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.3"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.3"/></svg>
@@ -2070,6 +2198,7 @@ PAGE_HTML = """
       </div>
       <div id="galeria-contagem" class="hint" style="display:none; margin-bottom:8px;"></div>
       <div id="galeria" class="gallery"></div>
+      <div id="galeria-paginacao" class="gallery-pagination" aria-label="Paginacao da galeria"></div>
     </section>
 
     <section class="card tr-card" id="tr-config">
@@ -2165,6 +2294,43 @@ PAGE_HTML = """
     </section>
   </main>
 
+  <main class="content" id="view-classificacao" style="display:none;">
+    <section class="card">
+      <h2>Treinamento por classificação</h2>
+      <p class="hint">Use esta tela para modelos do tipo <strong>Classificação</strong>. Envie um ZIP contendo <code>train/</code>, <code>valid/</code> (ou <code>val/</code>) e opcionalmente <code>test/</code>; dentro de cada uma, uma pasta para cada classe. Ex.: <code>train/modest/foto.jpg</code>.</p>
+      <div id="classificacao-aviso" class="hint" style="margin:12px 0;"></div>
+      <div class="capture-panel" style="max-width:520px;">
+        <input type="file" id="class-input-zip" accept=".zip,application/zip" />
+        <button id="btn-class-importar" class="btn-primary">Importar dataset ZIP</button>
+        <div id="class-importar-resultado" class="hint"></div>
+      </div>
+      <div class="panel-divider"></div>
+      <p class="hint">Ou adicione fotos gradualmente, informando a classe e a divisão.</p>
+      <div class="training-form">
+        <label>Classe <input id="class-nome-classe" type="text" placeholder="Ex.: modest" /></label>
+        <label>Divisão <select id="class-split"><option value="train">Treino</option><option value="valid">Validação</option><option value="test">Teste</option></select></label>
+        <input type="file" id="class-input-imagens" accept="image/jpeg,image/png" multiple />
+        <button id="btn-class-imagens" class="btn-secondary">Adicionar imagens</button>
+      </div>
+      <div id="class-imagens-resultado" class="hint" style="margin-top:8px;"></div>
+      <div class="panel-divider"></div>
+      <div class="card-header"><h3 style="margin:0; font-size:15px;">Imagens importadas</h3><button id="btn-class-atualizar" type="button" class="btn-secondary">Atualizar prévia</button></div>
+      <div id="class-galeria-info" class="hint" style="margin:8px 0;"></div>
+      <div id="class-galeria" class="gallery"></div>
+    </section>
+    <section class="card">
+      <h2>Treinar o modelo de classificação</h2>
+      <p class="hint">Após importar as imagens, inicie o treinamento. Ao concluir, o modelo ficará disponível em “Testador IA” para avaliar uma foto.</p>
+      <div class="training-form">
+        <label>Épocas <input id="class-epocas" type="number" min="1" value="30" /></label>
+        <label>Tamanho da imagem <input id="class-imgsz" type="number" min="32" value="224" /></label>
+        <label>Batch <input id="class-batch" type="number" min="1" value="16" /></label>
+        <button id="btn-class-treinar" class="btn-primary">Iniciar treinamento</button>
+      </div>
+      <div id="class-treinar-resultado" class="hint" style="margin-top:10px;"></div>
+    </section>
+  </main>
+
   <div id="selecao-barra" class="selecao-barra">
     <span id="selecao-contagem" class="selecao-barra-contagem">0 selecionadas</span>
     <div class="selecao-barra-acoes">
@@ -2192,11 +2358,11 @@ PAGE_HTML = """
       </div>
       <div class="tester-grid" style="margin-top:16px;">
         <div>
-          <h3 style="font-size:11px; text-transform:uppercase; color:var(--text-muted); margin:0 0 6px;">Original</h3>
+          <h3 style="font-size:13px; font-weight:600; color:var(--text); margin:0 0 6px;">Original</h3>
           <img id="test-img-original" style="display:none;" />
         </div>
         <div>
-          <h3 style="font-size:11px; text-transform:uppercase; color:var(--text-muted); margin:0 0 6px;">Deteccoes</h3>
+          <h3 style="font-size:13px; font-weight:600; color:var(--text); margin:0 0 6px;">Deteccoes</h3>
           <img id="test-img-resultado" style="display:none;" />
         </div>
       </div>
@@ -2232,6 +2398,44 @@ PAGE_HTML = """
           <button id="btn-video-parar" class="btn-secondary" style="margin-top:10px;">Parar teste</button>
         </div>
       </div>
+    </section>
+  </main>
+
+  <main class="content" id="view-lote" style="display:none;">
+    <section class="card">
+      <h2>Carregamento em Lote</h2>
+      <p class="hint">Selecione varias imagens, analise-as com um modelo treinado e, depois de conferir o resumo, salve todas com as marcacoes detectadas no projeto atual.</p>
+      <div class="training-form">
+        <label>Modelo treinado
+          <select id="lote-sel-modelo" style="min-width:300px;"></select>
+        </label>
+        <label>Confianca minima
+          <input type="number" id="lote-conf" value="0.4" min="0.05" max="0.95" step="0.05" style="min-width:90px;" />
+        </label>
+      </div>
+      <div class="capture-panel" style="margin-top:14px; max-width:460px;">
+        <input type="file" id="lote-input-imagens" accept="image/jpeg,image/png" multiple />
+        <div id="lote-arquivos" class="hint">Nenhuma imagem selecionada.</div>
+        <button id="btn-lote-analisar" class="btn-primary">Analisar imagens</button>
+        <div id="lote-resultado" class="hint"></div>
+      </div>
+    </section>
+    <section class="card" id="lote-salvar-card" style="display:none;">
+      <h2>Resultado da analise</h2>
+      <div id="lote-resumo" class="hint" style="margin-bottom:14px;"></div>
+      <div id="lote-lista" class="lote-preview-grid" style="max-height:560px; overflow:auto; margin-bottom:16px;"></div>
+      <div class="training-form" style="align-items:end;">
+        <label>Salvar imagens analisadas em
+          <select id="lote-destino">
+            <option value="pendentes">Pendentes (para revisar depois)</option>
+            <option value="treino">Treino</option>
+            <option value="validacao">Validacao</option>
+          </select>
+        </label>
+        <button id="btn-lote-salvar" class="btn-primary">Salvar imagens e marcacoes</button>
+        <button id="btn-lote-descartar" class="btn-secondary">Descartar lote</button>
+      </div>
+      <div id="lote-salvar-resultado" class="hint" style="margin-top:10px;"></div>
     </section>
   </main>
 
@@ -2313,13 +2517,14 @@ PAGE_HTML = """
             <button type="button" id="btn-anotacao-proxima" class="icon-btn nav-arrow" title="Proxima foto">&rsaquo;</button>
           </div>
         </div>
-        <div class="modal-side">
+        <div class="modal-tools">
           <h3>Classe ativa (usada ao desenhar)</h3>
           <div id="modal-classes" class="chip-list"></div>
           <div id="modo-anotacao-row" class="radio-row" style="display:none;">
             <label><input type="radio" name="modo-anotacao" value="rect" checked /> Retangulo</label>
             <label id="opcao-modo-poligono"><input type="radio" name="modo-anotacao" value="poligono" /> Poligono</label>
             <label><input type="radio" name="modo-anotacao" value="varinha" /> Varinha magica</label>
+            <label><input type="radio" name="modo-anotacao" value="auto" /> Auto deteccao</label>
           </div>
           <p id="modo-anotacao-hint" class="hint" style="display:none;">Clique nos vertices do objeto e feche clicando de novo no ponto inicial (min. 3 pontos). Esc cancela.</p>
           <div id="varinha-config-row" class="panel-block" style="display:none;">
@@ -2329,19 +2534,44 @@ PAGE_HTML = """
               <span id="varinha-raio-valor" class="hint">20%</span>
             </div>
           </div>
-          <h3>Caixas desenhadas</h3>
-          <p class="hint" style="margin:0 0 6px;">Para corrigir uma marcacao (ex.: feita pela IA): clique nela na imagem ou na lista e escolha a classe certa (no seletor ou nos botoes de classe acima). Delete apaga a selecionada.</p>
-          <ul id="lista-caixas" class="boxes-list"><li class="hint">Nenhuma caixa desenhada.</li></ul>
-          <h3>Salvar como</h3>
-          <div class="radio-row">
-            <label><input type="radio" name="destino" value="treino" checked /> Treino</label>
-            <label><input type="radio" name="destino" value="validacao" /> Validacao</label>
+          <div id="auto-config-row" class="panel-block" style="display:none; flex-direction:column; align-items:stretch; gap:6px;">
+            <span class="panel-label">Modelo usado na auto deteccao</span>
+            <select id="auto-sel-modelo"><option value="">Carregando modelos...</option></select>
+            <div style="display:flex; align-items:center; gap:8px;">
+              <span class="panel-label" title="Confianca minima para aceitar uma deteccao do modelo.">Confianca</span>
+              <input type="number" id="auto-conf" value="0.4" min="0.05" max="0.95" step="0.05" style="min-width:80px;" />
+            </div>
+            <label class="hint"><input type="checkbox" id="auto-substituir" /> Substituir marcacoes existentes</label>
+            <label class="hint"><input type="checkbox" id="auto-ao-abrir" /> Detectar automaticamente ao abrir cada foto (se nao tiver marcacao)</label>
+            <button type="button" id="btn-auto-detectar" class="btn-primary">Detectar agora</button>
           </div>
-          <div style="margin-top: 12px;">
-            <button id="btn-salvar-anotacao" class="btn-primary">Salvar anotacao</button>
-          </div>
-          <div id="anotacao-resultado" class="hint"></div>
         </div>
+        <div class="modal-side">
+          <h3>Marcacoes <span id="contagem-caixas" class="hint"></span></h3>
+          <p class="hint" style="margin:0;">Passe o mouse para ver a marcacao na imagem. Clique para selecionar e trocar a classe; Delete apaga.</p>
+          <ul id="lista-caixas" class="boxes-list"><li class="hint">Nenhuma caixa desenhada.</li></ul>
+          <div class="modal-salvar">
+            <h3>Salvar como</h3>
+            <div class="radio-row">
+              <label><input type="radio" name="destino" value="treino" checked /> Treino</label>
+              <label><input type="radio" name="destino" value="validacao" /> Validacao</label>
+            </div>
+            <button id="btn-salvar-anotacao" class="btn-primary btn-block">Salvar anotacao</button>
+            <div id="anotacao-resultado" class="hint"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="modal-lote-preview" class="modal">
+    <div class="modal-box" style="max-width:96vw; width:auto;">
+      <div class="modal-header">
+        <strong id="modal-lote-preview-titulo">Marcacoes detectadas</strong>
+        <button id="modal-lote-preview-fechar" class="icon-btn" aria-label="Fechar visualizacao">&times;</button>
+      </div>
+      <div style="padding:14px; background:#111;">
+        <img id="modal-lote-preview-imagem" class="lote-popup-image" src="" alt="Imagem analisada com marcacoes" />
       </div>
     </div>
   </div>
@@ -2363,6 +2593,7 @@ PAGE_HTML = """
         <div class="radio-row">
           <label><input type="radio" name="novo-projeto-tipo" value="detect" checked /> Deteccao (caixa)</label>
           <label><input type="radio" name="novo-projeto-tipo" value="segment" /> Segmentacao (contorno preciso)</label>
+          <label><input type="radio" name="novo-projeto-tipo" value="classify" /> Classificacao (pastas por classe)</label>
         </div>
         <button id="btn-criar-projeto" class="btn-primary" style="margin-top: 14px;">Criar modelo</button>
         <div id="novo-projeto-resultado" class="hint"></div>
@@ -2434,7 +2665,7 @@ PAGE_HTML = """
     const PALETTE = ['#22c55e', '#f59e0b', '#3b82f6', '#ef4444', '#a855f7', '#14b8a6', '#eab308', '#ec4899'];
     // selectedBox: indice da marcacao selecionada (-1 = nenhuma). Com uma marcacao
     // selecionada, clicar numa classe troca a classe dela.
-    const state = { classes: [], activeClassIndex: 0, currentImage: null, boxes: [], drawing: false, mode: 'rect', polyPoints: [], selectedBox: -1 };
+    const state = { classes: [], activeClassIndex: 0, currentImage: null, boxes: [], drawing: false, mode: 'rect', polyPoints: [], selectedBox: -1, hoverBox: -1, hoverClass: -1 };
     let abaAtiva = 'pendentes';
     let projetoAtual = localStorage.getItem('treinamento_projeto_atual') || '';
     let projetoTask = 'detect';
@@ -2443,6 +2674,7 @@ PAGE_HTML = """
       rect: 'Clique e arraste para desenhar um retangulo ao redor do objeto.',
       poligono: 'Clique nos vertices do objeto e feche clicando de novo no ponto inicial (min. 3 pontos). Esc cancela.',
       varinha: 'Clique no centro do objeto -- o contorno e detectado automaticamente ao redor dele. Se pegar area demais (ou de menos), ajuste o "Tamanho da selecao" e clique de novo.',
+      auto: 'Escolha um modelo treinado e clique em "Detectar agora": todas as classes que o modelo encontrar na imagem sao marcadas automaticamente. Classes novas sao cadastradas no projeto. Revise e corrija antes de salvar.',
     };
 
     function atualizarUiModo() {
@@ -2450,7 +2682,85 @@ PAGE_HTML = """
       const configRow = document.getElementById('varinha-config-row');
       modoHint.textContent = DICAS_MODO[state.mode] || '';
       configRow.style.display = state.mode === 'varinha' ? 'flex' : 'none';
+      document.getElementById('auto-config-row').style.display = state.mode === 'auto' ? 'flex' : 'none';
+      if (state.mode === 'auto') carregarModelosAuto();
     }
+
+    let modelosAutoCarregados = false;
+    async function carregarModelosAuto(forcar) {
+      if (modelosAutoCarregados && !forcar) return;
+      const sel = document.getElementById('auto-sel-modelo');
+      try {
+        const res = await fetch('/testador/modelos');
+        const lista = await res.json();
+        let salvo = null;
+        try { salvo = localStorage.getItem('treinamento_auto_modelo'); } catch (_) {}
+        sel.innerHTML = lista.length
+          ? lista.map((m) => `<option value="${m.projeto}|${m.run}">${m.projeto} - ${m.run} (${m.modificado})</option>`).join('')
+          : '<option value="">Nenhum modelo treinado ainda</option>';
+        if (salvo && lista.some((m) => `${m.projeto}|${m.run}` === salvo)) sel.value = salvo;
+        modelosAutoCarregados = true;
+      } catch (_) {
+        sel.innerHTML = '<option value="">Falha ao carregar modelos</option>';
+      }
+    }
+
+    async function executarAutoDeteccao() {
+      const resultEl = document.getElementById('anotacao-resultado');
+      if (!state.currentImage) return;
+      const modelo = document.getElementById('auto-sel-modelo').value;
+      if (!modelo) { resultEl.textContent = 'Selecione um modelo treinado para a auto deteccao.'; resultEl.className = 'hint err'; return; }
+      const [projetoModelo, run] = modelo.split('|');
+      const imagemAlvo = state.currentImage.nome;
+      const btn = document.getElementById('btn-auto-detectar');
+      btn.disabled = true;
+      resultEl.textContent = 'Detectando objetos com o modelo...';
+      resultEl.className = 'hint';
+      try {
+        const res = await fetch('/anotar/auto_deteccao', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            projeto: projetoAtual, pasta: state.currentImage.pasta, nome: imagemAlvo,
+            projeto_modelo: projetoModelo, run, conf: document.getElementById('auto-conf').value,
+          }),
+        });
+        const data = await res.json();
+        if (!state.currentImage || state.currentImage.nome !== imagemAlvo) return;
+        if (!data.ok) { resultEl.textContent = data.erro || 'Falha na auto deteccao.'; resultEl.className = 'hint err'; return; }
+        if (data.classes_novas && data.classes_novas.length) await carregarClasses();
+        if (document.getElementById('auto-substituir').checked) state.boxes = [];
+        state.boxes.push(...data.caixas);
+        state.selectedBox = -1;
+        renderListaCaixas();
+        const novas = data.classes_novas && data.classes_novas.length ? ` Classes novas cadastradas: ${data.classes_novas.join(', ')}.` : '';
+        resultEl.textContent = data.caixas.length
+          ? `${data.caixas.length} objeto(s) detectado(s). Revise e clique em "Salvar anotacao".${novas}`
+          : 'Nenhum objeto detectado com essa confianca.';
+        resultEl.className = data.caixas.length ? 'hint ok' : 'hint';
+      } catch (_) {
+        resultEl.textContent = 'Falha ao contatar o servidor.';
+        resultEl.className = 'hint err';
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    document.getElementById('btn-auto-detectar').addEventListener('click', executarAutoDeteccao);
+    (function () {
+      const sel = document.getElementById('auto-sel-modelo');
+      const conf = document.getElementById('auto-conf');
+      const subst = document.getElementById('auto-substituir');
+      const aoAbrir = document.getElementById('auto-ao-abrir');
+      try {
+        const c = localStorage.getItem('treinamento_auto_conf'); if (c) conf.value = c;
+        subst.checked = localStorage.getItem('treinamento_auto_substituir') === '1';
+        aoAbrir.checked = localStorage.getItem('treinamento_auto_ao_abrir') === '1';
+      } catch (_) {}
+      sel.addEventListener('change', () => { try { localStorage.setItem('treinamento_auto_modelo', sel.value); } catch (_) {} });
+      conf.addEventListener('change', () => { try { localStorage.setItem('treinamento_auto_conf', conf.value); } catch (_) {} });
+      subst.addEventListener('change', () => { try { localStorage.setItem('treinamento_auto_substituir', subst.checked ? '1' : '0'); } catch (_) {} });
+      aoAbrir.addEventListener('change', () => { try { localStorage.setItem('treinamento_auto_ao_abrir', aoAbrir.checked ? '1' : '0'); } catch (_) {} });
+    })();
 
     document.querySelectorAll('.side-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
@@ -2460,8 +2770,16 @@ PAGE_HTML = """
         document.getElementById('view-treinamento').style.display = view === 'treinamento' ? 'flex' : 'none';
         document.getElementById('view-cameras').style.display = view === 'cameras' ? 'flex' : 'none';
         document.getElementById('view-testador').style.display = view === 'testador' ? 'flex' : 'none';
+        document.getElementById('view-lote').style.display = view === 'lote' ? 'flex' : 'none';
+        document.getElementById('view-classificacao').style.display = view === 'classificacao' ? 'flex' : 'none';
         document.getElementById('view-modelos').style.display = view === 'modelos' ? 'flex' : 'none';
         if (view === 'testador') carregarModelosTestador();
+        if (view === 'classificacao') {
+          document.getElementById('classificacao-aviso').textContent = projetoTask === 'classify'
+            ? `Modelo ativo: ${projetoAtual}.` : 'Selecione ou crie um modelo do tipo Classificacao para importar este formato.';
+          carregarGaleriaClassificacao();
+        }
+        if (view === 'lote') carregarModelosTestador();
         if (view === 'cameras') carregarCameras();
         if (view === 'modelos') { mostrarListaModelos(); carregarModelos(); }
       });
@@ -2753,6 +3071,10 @@ PAGE_HTML = """
         principal.querySelectorAll('[data-renomear]').forEach((b) => b.addEventListener('click', () => renomearClasse(+b.dataset.renomear)));
         principal.querySelectorAll('[data-remover]').forEach((b) => b.addEventListener('click', () => removerClasse(+b.dataset.remover)));
       }
+      document.querySelectorAll('#modal-classes .chip-select').forEach((btn) => {
+        btn.addEventListener('mouseenter', () => definirFoco(-1, parseInt(btn.getAttribute('data-idx'), 10)));
+        btn.addEventListener('mouseleave', () => definirFoco(-1, -1));
+      });
       document.querySelectorAll('#lista-classes .chip-select, #modal-classes .chip-select').forEach((btn) => {
         btn.addEventListener('click', () => {
           state.activeClassIndex = parseInt(btn.getAttribute('data-idx'), 10);
@@ -2999,21 +3321,27 @@ PAGE_HTML = """
     });
 
     let galeriaItens = [];
-    let ultimosDadosImagens = { pendentes: [], treino: [], validacao: [] };
     let filtroClasses = [];
+    let paginaGaleria = 1;
+    let paginacaoGaleria = { pagina: 1, total_paginas: 1, total: 0, por_pagina: 36 };
+    let contagensImagens = { pendentes: 0, treino: 0, validacao: 0 };
 
     async function carregarImagens() {
       if (!projetoAtual) return;
-      const res = await fetch(`/imagens?${qp()}`);
+      const classesFiltradas = abaAtiva !== 'pendentes' && filtroClasses.length ? filtroClasses.join(',') : '';
+      const res = await fetch(`/imagens?${qp({ pasta: abaAtiva, pagina: paginaGaleria, por_pagina: paginacaoGaleria.por_pagina, classes: classesFiltradas })}`);
       const data = await res.json();
-      ultimosDadosImagens = data;
-      document.getElementById('count-pendentes').textContent = data.pendentes.length;
-      document.getElementById('count-treino').textContent = data.treino.length;
-      document.getElementById('count-validacao').textContent = data.validacao.length;
+      galeriaItens = data.itens || [];
+      paginacaoGaleria = data.paginacao || paginacaoGaleria;
+      paginaGaleria = paginacaoGaleria.pagina;
+      contagensImagens = data.contagens || contagensImagens;
+      document.getElementById('count-pendentes').textContent = contagensImagens.pendentes;
+      document.getElementById('count-treino').textContent = contagensImagens.treino;
+      document.getElementById('count-validacao').textContent = contagensImagens.validacao;
       projetoTask = data.task || 'detect';
       atualizarSeletorModeloBase();
       renderFiltroClasses();
-      aplicarFiltroGaleria();
+      atualizarGaleria();
     }
 
     function renderFiltroClasses() {
@@ -3033,7 +3361,8 @@ PAGE_HTML = """
           const pos = filtroClasses.indexOf(idx);
           if (pos === -1) filtroClasses.push(idx); else filtroClasses.splice(pos, 1);
           renderFiltroClasses();
-          aplicarFiltroGaleria();
+          paginaGaleria = 1;
+          carregarImagens();
         });
       });
     }
@@ -3041,24 +3370,44 @@ PAGE_HTML = """
     document.getElementById('btn-limpar-filtro-classes').addEventListener('click', () => {
       filtroClasses = [];
       renderFiltroClasses();
-      aplicarFiltroGaleria();
+      paginaGaleria = 1;
+      carregarImagens();
     });
 
-    function aplicarFiltroGaleria() {
-      const todosItens = ultimosDadosImagens[abaAtiva] || [];
+    function atualizarGaleria() {
       const emFiltro = abaAtiva !== 'pendentes' && filtroClasses.length > 0;
-      const itensFiltrados = emFiltro
-        ? todosItens.filter((item) => item.classes && item.classes.some((c) => filtroClasses.includes(c)))
-        : todosItens;
-      galeriaItens = itensFiltrados;
       const contagemEl = document.getElementById('galeria-contagem');
-      if (emFiltro) {
+      if (emFiltro || paginacaoGaleria.total) {
         contagemEl.style.display = 'block';
-        contagemEl.textContent = `Mostrando ${itensFiltrados.length} de ${todosItens.length} imagens`;
+        const inicio = paginacaoGaleria.total ? (paginacaoGaleria.pagina - 1) * paginacaoGaleria.por_pagina + 1 : 0;
+        const fim = Math.min(inicio + galeriaItens.length - 1, paginacaoGaleria.total);
+        contagemEl.textContent = `${emFiltro ? 'Filtro: ' : ''}mostrando ${inicio}-${fim} de ${paginacaoGaleria.total} imagens`;
       } else {
         contagemEl.style.display = 'none';
       }
       renderGaleria(galeriaItens);
+      renderPaginacaoGaleria();
+    }
+
+    function renderPaginacaoGaleria() {
+      const wrap = document.getElementById('galeria-paginacao');
+      const { pagina, total_paginas: total } = paginacaoGaleria;
+      if (total <= 1) { wrap.innerHTML = ''; return; }
+      const paginas = Array.from({ length: total }, (_, i) => i + 1)
+        .filter((p) => p === 1 || p === total || Math.abs(p - pagina) <= 2);
+      let anterior = 0;
+      const botoes = paginas.map((p) => {
+        const reticencias = p - anterior > 1 ? '<span class="pagination-info">...</span>' : '';
+        anterior = p;
+        return `${reticencias}<button type="button" data-pagina="${p}" class="${p === pagina ? 'active' : ''}" ${p === pagina ? 'aria-current="page"' : ''}>${p}</button>`;
+      }).join('');
+      wrap.innerHTML = `<button type="button" data-pagina="${pagina - 1}" ${pagina <= 1 ? 'disabled' : ''} aria-label="Pagina anterior">Anterior</button>${botoes}<button type="button" data-pagina="${pagina + 1}" ${pagina >= total ? 'disabled' : ''} aria-label="Proxima pagina">Proxima</button>`;
+      wrap.querySelectorAll('button[data-pagina]').forEach((btn) => btn.addEventListener('click', () => {
+        const destino = parseInt(btn.getAttribute('data-pagina'), 10);
+        if (destino === pagina || destino < 1 || destino > total) return;
+        paginaGaleria = destino;
+        carregarImagens();
+      }));
     }
 
     function atualizarSeletorModeloBase() {
@@ -3180,6 +3529,7 @@ PAGE_HTML = """
         document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));
         btn.classList.add('active');
         abaAtiva = btn.getAttribute('data-tab');
+        paginaGaleria = 1;
         sairModoSelecao();
         carregarImagens();
       });
@@ -3213,6 +3563,8 @@ PAGE_HTML = """
       state.boxes = [];
       state.polyPoints = [];
       state.selectedBox = -1;
+      state.hoverBox = -1;
+      state.hoverClass = -1;
       document.getElementById('modal-titulo').textContent = `Anotar: ${nome}`;
       document.getElementById('anotacao-resultado').textContent = '';
       const modoRow = document.getElementById('modo-anotacao-row');
@@ -3242,6 +3594,13 @@ PAGE_HTML = """
         }
       } catch (_) {}
 
+      // Auto deteccao ao abrir: so roda se a foto ainda nao tem marcacao
+      if (state.mode === 'auto' && document.getElementById('auto-ao-abrir').checked
+          && state.currentImage && state.currentImage.nome === nome && !state.boxes.length) {
+        await carregarModelosAuto();
+        executarAutoDeteccao();
+      }
+
       const img = new Image();
       img.onload = () => {
         imagemCarregada = img;
@@ -3249,8 +3608,9 @@ PAGE_HTML = """
         // imagem) -- limitando o canvas a essa altura, as setas de
         // navegacao ficam sempre na mesma posicao entre uma foto e outra,
         // independente da proporcao de cada imagem.
-        const navRow = document.querySelector('.canvas-nav-row');
-        const maxW = Math.min(760, window.innerWidth - 430);
+        // O canvas ocupa o espaco livre da coluna do meio (descontando as setas)
+        const navRow = document.querySelector('#modal-anotacao .canvas-nav-row');
+        const maxW = navRow && navRow.clientWidth ? navRow.clientWidth - 90 : Math.min(760, window.innerWidth - 430);
         const maxH = navRow ? navRow.clientHeight : 520;
         const scale = Math.min(1, maxW / img.naturalWidth, (maxH || 520) / img.naturalHeight);
         canvas.width = Math.round(img.naturalWidth * scale);
@@ -3273,18 +3633,27 @@ PAGE_HTML = """
         posEl.textContent = '';
         return;
       }
-      btnAnt.disabled = idx <= 0;
-      btnProx.disabled = idx >= galeriaItens.length - 1;
-      posEl.textContent = `${idx + 1} de ${galeriaItens.length}`;
+      btnAnt.disabled = idx <= 0 && paginacaoGaleria.pagina <= 1;
+      btnProx.disabled = idx >= galeriaItens.length - 1 && paginacaoGaleria.pagina >= paginacaoGaleria.total_paginas;
+      const posicao = (paginacaoGaleria.pagina - 1) * paginacaoGaleria.por_pagina + idx + 1;
+      posEl.textContent = `${posicao} de ${paginacaoGaleria.total}`;
     }
 
-    function navegarAnotacao(direcao) {
+    async function navegarAnotacao(direcao) {
       if (!state.currentImage) return;
       const idx = galeriaItens.findIndex((it) => it.nome === state.currentImage.nome);
       if (idx === -1) return;
       const novoIdx = idx + direcao;
-      if (novoIdx < 0 || novoIdx >= galeriaItens.length) return;
-      abrirAnotacao(state.currentImage.pasta, galeriaItens[novoIdx].nome);
+      if (novoIdx >= 0 && novoIdx < galeriaItens.length) {
+        abrirAnotacao(state.currentImage.pasta, galeriaItens[novoIdx].nome);
+        return;
+      }
+      const proximaPagina = paginacaoGaleria.pagina + direcao;
+      if (proximaPagina < 1 || proximaPagina > paginacaoGaleria.total_paginas) return;
+      paginaGaleria = proximaPagina;
+      await carregarImagens();
+      const destino = direcao > 0 ? 0 : galeriaItens.length - 1;
+      if (galeriaItens[destino]) abrirAnotacao(state.currentImage.pasta, galeriaItens[destino].nome);
     }
 
     document.getElementById('btn-anotacao-anterior').addEventListener('click', () => navegarAnotacao(-1));
@@ -3304,9 +3673,18 @@ PAGE_HTML = """
       if (!imagemCarregada) return;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(imagemCarregada, 0, 0, canvas.width, canvas.height);
-      state.boxes.forEach((box, idx) => {
+      // Destaque ao passar o mouse (na lista, nas classes ou na propria imagem):
+      // a(s) marcacao(oes) em foco ficam preenchidas e as demais ficam apagadas.
+      const emFoco = (box, idx) => idx === state.hoverBox || box.classe === state.hoverClass;
+      const temFoco = state.boxes.some(emFoco);
+      // desenha as em foco por ultimo, para ficarem por cima das outras
+      const ordem = state.boxes.map((_, i) => i).sort((a, b) => emFoco(state.boxes[a], a) - emFoco(state.boxes[b], b));
+      ordem.forEach((idx) => {
+        const box = state.boxes[idx];
         const cor = PALETTE[box.classe % PALETTE.length];
-        const selecionada = idx === state.selectedBox;
+        const focada = temFoco && emFoco(box, idx);
+        const selecionada = idx === state.selectedBox || focada;
+        ctx.globalAlpha = temFoco && !focada ? 0.3 : 1;
         let x, y;
         if (box.pontos) {
           const pontosCanvas = box.pontos.map(([px, py]) => [px * canvas.width, py * canvas.height]);
@@ -3329,14 +3707,17 @@ PAGE_HTML = """
           ctx.strokeRect(x, y, w, h);
         }
         ctx.lineWidth = 2;
-        const nomeClasse = state.classes[box.classe] || '?';
-        ctx.font = '11px sans-serif';
+        // numero da marcacao + classe: o mesmo numero aparece na lista ao lado
+        const nomeClasse = `${idx + 1} ${state.classes[box.classe] || '?'}`;
+        ctx.font = focada ? '600 13px "IBM Plex Sans", sans-serif' : '11px "IBM Plex Sans", sans-serif';
+        const alturaLabel = focada ? 20 : 16;
         const labelW = ctx.measureText(nomeClasse).width + 8;
         ctx.fillStyle = cor;
-        ctx.fillRect(x, Math.max(0, y - 16), labelW, 16);
+        ctx.fillRect(x, Math.max(0, y - alturaLabel), labelW, alturaLabel);
         ctx.fillStyle = '#0b1220';
-        ctx.fillText(nomeClasse, x + 4, Math.max(11, y - 4));
+        ctx.fillText(nomeClasse, x + 4, Math.max(alturaLabel - 5, y - 5));
       });
+      ctx.globalAlpha = 1;
       if (state.mode === 'rect' && state.drawing) {
         ctx.strokeStyle = PALETTE[state.activeClassIndex % PALETTE.length];
         ctx.setLineDash([4, 3]);
@@ -3394,6 +3775,9 @@ PAGE_HTML = """
         state.mouseX = curX; state.mouseY = curY;
         desenharCanvas();
       }
+      if (!state.drawing && !state.polyPoints.length && canvas.width > 0) {
+        definirFoco(caixaEm(curX / canvas.width, curY / canvas.height), -1);
+      }
     });
 
     window.addEventListener('mouseup', () => {
@@ -3429,6 +3813,10 @@ PAGE_HTML = """
 
     // entre as marcacoes que contem o ponto, escolhe a menor (a mais "por cima")
     function selecionarCaixaEm(x, y) {
+      selecionarCaixa(caixaEm(x, y));
+    }
+
+    function caixaEm(x, y) {
       let melhor = -1, menorArea = Infinity;
       state.boxes.forEach((box, i) => {
         let dentro, area;
@@ -3442,8 +3830,24 @@ PAGE_HTML = """
         }
         if (dentro && area < menorArea) { melhor = i; menorArea = area; }
       });
-      selecionarCaixa(melhor);
+      return melhor;
     }
+
+    // foco ao passar o mouse: destaca a marcacao na imagem e a linha na lista
+    function definirFoco(boxIdx, classeIdx) {
+      if (state.hoverBox === boxIdx && state.hoverClass === classeIdx) return;
+      state.hoverBox = boxIdx;
+      state.hoverClass = classeIdx;
+      document.querySelectorAll('#lista-caixas li[data-sel]').forEach((li) => {
+        const i = parseInt(li.getAttribute('data-sel'), 10);
+        const foco = i === boxIdx || (state.boxes[i] && state.boxes[i].classe === classeIdx);
+        li.classList.toggle('hover', foco);
+        if (foco && i === boxIdx) li.scrollIntoView({ block: 'nearest' });
+      });
+      desenharCanvas();
+    }
+
+    canvas.addEventListener('mouseleave', () => definirFoco(-1, -1));
 
     function selecionarCaixa(i) {
       state.selectedBox = i;
@@ -3453,6 +3857,13 @@ PAGE_HTML = """
     }
 
     canvas.addEventListener('click', async (ev) => {
+      if (state.mode === 'auto') {
+        // no modo auto, clicar na imagem so seleciona a marcacao (pra corrigir a classe ou apagar)
+        if (canvas.width === 0) return;
+        const [x, y] = posicaoNoCanvas(ev);
+        selecionarCaixaEm(x / canvas.width, y / canvas.height);
+        return;
+      }
       if (state.mode === 'poligono') {
         if (!state.classes.length) { alert('Cadastre uma classe antes de desenhar.'); return; }
         const [x, y] = posicaoNoCanvas(ev);
@@ -3571,6 +3982,7 @@ PAGE_HTML = """
 
     function removerCaixa(i) {
       state.boxes.splice(i, 1);
+      state.hoverBox = -1;
       if (state.selectedBox === i) state.selectedBox = -1;
       else if (state.selectedBox > i) state.selectedBox -= 1;
       renderListaCaixas();
@@ -3578,6 +3990,8 @@ PAGE_HTML = """
 
     function renderListaCaixas() {
       const ul = document.getElementById('lista-caixas');
+      const contagemEl = document.getElementById('contagem-caixas');
+      if (contagemEl) contagemEl.textContent = state.boxes.length ? `(${state.boxes.length})` : '';
       if (!state.boxes.length) {
         ul.innerHTML = '<li class="hint">Nenhuma caixa desenhada.</li>';
       } else {
@@ -3587,6 +4001,7 @@ PAGE_HTML = """
           + (atual >= state.classes.length ? `<option value="${atual}" selected>? (classe ${atual})</option>` : '');
         ul.innerHTML = state.boxes.map((box, i) => `
           <li data-sel="${i}" class="${i === state.selectedBox ? 'sel' : ''}" title="Clique para selecionar esta marcacao">
+            <span class="num">${i + 1}</span>
             <span style="color:${PALETTE[box.classe % PALETTE.length]}">&#9632;</span>
             <select data-classe="${i}" title="Trocar a classe desta marcacao">${opcoes(box.classe)}</select>
             <button type="button" data-idx="${i}" class="link-btn-sm">remover</button>
@@ -3610,6 +4025,8 @@ PAGE_HTML = """
           });
         });
         ul.querySelectorAll('li[data-sel]').forEach((li) => {
+          li.addEventListener('mouseenter', () => definirFoco(parseInt(li.getAttribute('data-sel'), 10), -1));
+          li.addEventListener('mouseleave', () => definirFoco(-1, -1));
           li.addEventListener('click', () => {
             const i = parseInt(li.getAttribute('data-sel'), 10);
             selecionarCaixa(i === state.selectedBox ? -1 : i);
@@ -4000,7 +4417,141 @@ PAGE_HTML = """
         : '<option value="">Nenhum modelo treinado ainda</option>';
       document.getElementById('test-sel-modelo').innerHTML = optionsHtml;
       document.getElementById('test-video-sel-modelo').innerHTML = optionsHtml;
+      document.getElementById('lote-sel-modelo').innerHTML = optionsHtml;
     }
+
+    let loteAtual = null;
+    const loteInput = document.getElementById('lote-input-imagens');
+    loteInput.addEventListener('change', () => {
+      const n = loteInput.files.length;
+      document.getElementById('lote-arquivos').textContent = n ? `${n} imagem(ns) selecionada(s).` : 'Nenhuma imagem selecionada.';
+    });
+
+    document.getElementById('btn-lote-analisar').addEventListener('click', async () => {
+      const modelo = document.getElementById('lote-sel-modelo').value;
+      const resultadoEl = document.getElementById('lote-resultado');
+      if (!projetoAtual) { resultadoEl.textContent = 'Selecione ou crie o projeto que recebera as imagens.'; resultadoEl.className = 'hint err'; return; }
+      if (!modelo) { resultadoEl.textContent = 'Nenhum modelo treinado disponivel.'; resultadoEl.className = 'hint err'; return; }
+      if (!loteInput.files.length) { resultadoEl.textContent = 'Selecione ao menos uma imagem.'; resultadoEl.className = 'hint err'; return; }
+      const [projetoModelo, run] = modelo.split('|');
+      const fd = new FormData();
+      fd.append('projeto_destino', projetoAtual);
+      fd.append('projeto_modelo', projetoModelo);
+      fd.append('run', run);
+      fd.append('conf', document.getElementById('lote-conf').value);
+      [...loteInput.files].forEach((arquivo) => fd.append('arquivos', arquivo));
+      const btn = document.getElementById('btn-lote-analisar');
+      btn.disabled = true;
+      resultadoEl.textContent = `Analisando ${loteInput.files.length} imagem(ns)...`;
+      resultadoEl.className = 'hint';
+      try {
+        const res = await fetch('/lote/analisar', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.erro || 'Falha ao analisar o lote.');
+        loteAtual = data.lote;
+        const totalDeteccoes = data.itens.reduce((soma, item) => soma + item.deteccoes, 0);
+        document.getElementById('lote-resumo').textContent = `${data.itens.length} imagem(ns) analisada(s), ${totalDeteccoes} marcacao(oes) detectada(s). Escolha o destino antes de salvar.`;
+        document.getElementById('lote-lista').innerHTML = data.itens.map((item) => `
+          <div class="lote-preview">
+            <img class="lote-preview-imagem" src="/lote/preview/${encodeURIComponent(data.lote)}/${encodeURIComponent(item.arquivo)}" alt="${item.nome}" loading="lazy" />
+            <div class="lote-preview-info"><span title="${item.nome}">${item.nome}</span><b>${item.deteccoes} marcacao(oes)</b></div>
+          </div>
+        `).join('');
+        document.querySelectorAll('.lote-preview-imagem').forEach((imagem) => imagem.addEventListener('click', () => {
+          document.getElementById('modal-lote-preview-titulo').textContent = imagem.alt || 'Marcacoes detectadas';
+          document.getElementById('modal-lote-preview-imagem').src = imagem.src;
+          document.getElementById('modal-lote-preview').style.display = 'flex';
+        }));
+        document.getElementById('lote-salvar-card').style.display = 'block';
+        resultadoEl.textContent = 'Analise concluida. As imagens ainda nao foram adicionadas ao projeto.';
+        resultadoEl.className = 'hint ok';
+      } catch (erro) {
+        resultadoEl.textContent = erro.message || 'Falha ao contatar o servidor.';
+        resultadoEl.className = 'hint err';
+      } finally { btn.disabled = false; }
+    });
+
+    document.getElementById('btn-lote-salvar').addEventListener('click', async () => {
+      const el = document.getElementById('lote-salvar-resultado');
+      if (!loteAtual) return;
+      const btn = document.getElementById('btn-lote-salvar');
+      btn.disabled = true;
+      el.textContent = 'Salvando imagens e marcacoes...'; el.className = 'hint';
+      try {
+        const res = await fetch('/lote/salvar', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lote: loteAtual, destino: document.getElementById('lote-destino').value }) });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.erro || 'Falha ao salvar o lote.');
+        el.textContent = `${data.salvos} imagem(ns) salva(s) em ${data.destino}.`;
+        el.className = 'hint ok'; loteAtual = null; loteInput.value = '';
+        document.getElementById('lote-arquivos').textContent = 'Nenhuma imagem selecionada.';
+        document.getElementById('lote-salvar-card').style.display = 'none';
+        carregarImagens();
+      } catch (erro) { el.textContent = erro.message || 'Falha ao contatar o servidor.'; el.className = 'hint err'; }
+      finally { btn.disabled = false; }
+    });
+
+    document.getElementById('btn-lote-descartar').addEventListener('click', async () => {
+      if (!loteAtual) return;
+      await fetch('/lote/descartar', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lote: loteAtual }) });
+      loteAtual = null;
+      document.getElementById('lote-salvar-card').style.display = 'none';
+      document.getElementById('lote-resultado').textContent = 'Lote descartado. Nenhuma imagem foi adicionada ao projeto.';
+      document.getElementById('lote-resultado').className = 'hint';
+    });
+
+    document.getElementById('modal-lote-preview-fechar').addEventListener('click', () => {
+      document.getElementById('modal-lote-preview').style.display = 'none';
+      document.getElementById('modal-lote-preview-imagem').src = '';
+    });
+
+    document.getElementById('btn-class-importar').addEventListener('click', async () => {
+      const input = document.getElementById('class-input-zip');
+      const el = document.getElementById('class-importar-resultado');
+      if (projetoTask !== 'classify') { el.textContent = 'Selecione um modelo de classificacao.'; el.className = 'hint err'; return; }
+      if (!input.files.length) { el.textContent = 'Escolha o arquivo ZIP do dataset.'; el.className = 'hint err'; return; }
+      const fd = new FormData(); fd.append('projeto', projetoAtual); fd.append('arquivo', input.files[0]);
+      el.textContent = 'Importando imagens...'; el.className = 'hint';
+      try {
+        const res = await fetch('/classificacao/importar', { method: 'POST', body: fd }); const data = await res.json();
+        if (!data.ok) throw new Error(data.erro || 'Falha ao importar.');
+        el.textContent = `${data.importadas} imagem(ns) importada(s). Classes de treino: ${data.classes.join(', ')}.`; el.className = 'hint ok';
+        await carregarClasses(); await carregarGaleriaClassificacao();
+      } catch (e) { el.textContent = e.message || 'Falha ao importar.'; el.className = 'hint err'; }
+    });
+    document.getElementById('btn-class-treinar').addEventListener('click', async () => {
+      const el = document.getElementById('class-treinar-resultado');
+      if (projetoTask !== 'classify') { el.textContent = 'Selecione um modelo de classificacao.'; el.className = 'hint err'; return; }
+      const body = { projeto: projetoAtual, epocas: +document.getElementById('class-epocas').value || 30,
+        imgsz: +document.getElementById('class-imgsz').value || 224, batch: +document.getElementById('class-batch').value || 16,
+        workers: 4, modelo_base: 'yolov8n-cls.pt' };
+      try { const r = await fetch('/treinamento/iniciar', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) }); const d = await r.json();
+        if (!d.ok) throw new Error(d.erro || 'Falha ao iniciar.');
+        el.textContent = 'Treinamento iniciado. Abrindo o acompanhamento em tempo real...'; el.className = 'hint ok';
+        document.querySelector('.side-btn[data-view="treinamento"]').click();
+      } catch (e) { el.textContent = e.message || 'Falha ao iniciar.'; el.className = 'hint err'; }
+    });
+    document.getElementById('btn-class-imagens').addEventListener('click', async () => {
+      const input = document.getElementById('class-input-imagens'), el = document.getElementById('class-imagens-resultado');
+      const classe = document.getElementById('class-nome-classe').value.trim();
+      if (projetoTask !== 'classify') { el.textContent = 'Selecione um modelo de classificacao.'; el.className = 'hint err'; return; }
+      if (!classe || !input.files.length) { el.textContent = 'Informe a classe e escolha pelo menos uma foto.'; el.className = 'hint err'; return; }
+      const fd = new FormData(); fd.append('projeto', projetoAtual); fd.append('classe', classe); fd.append('split', document.getElementById('class-split').value);
+      [...input.files].forEach((f) => fd.append('arquivos', f));
+      try { const r = await fetch('/classificacao/imagens', {method:'POST', body:fd}); const d = await r.json();
+        if (!d.ok) throw new Error(d.erro || 'Falha ao salvar fotos.'); el.textContent = `${d.salvas} foto(s) adicionada(s).`; el.className = 'hint ok'; input.value = ''; await carregarClasses(); await carregarGaleriaClassificacao();
+      } catch (e) { el.textContent = e.message || 'Falha ao salvar fotos.'; el.className = 'hint err'; }
+    });
+    async function carregarGaleriaClassificacao() {
+      const wrap = document.getElementById('class-galeria'), info = document.getElementById('class-galeria-info');
+      if (projetoTask !== 'classify') { wrap.innerHTML = ''; info.textContent = ''; return; }
+      try {
+        const res = await fetch(`/classificacao/imagens?${qp()}`), data = await res.json();
+        if (!data.ok) throw new Error(data.erro || 'Falha ao carregar imagens.');
+        info.textContent = `${data.total} imagem(ns): ${data.contagens.train} treino, ${data.contagens.valid} validação, ${data.contagens.test} teste. Mostrando as ${data.imagens.length} mais recentes.`;
+        wrap.innerHTML = data.imagens.map((it) => `<div class="thumb"><img src="/classificacao/imagem?${qp({split:it.split, classe:it.classe, nome:it.nome})}" alt="${it.classe}" loading="lazy"/><span class="thumb-meta">${it.split} · ${it.classe}</span></div>`).join('') || '<p class="hint">Nenhuma imagem importada ainda.</p>';
+      } catch (e) { info.textContent = e.message || 'Falha ao carregar prévia.'; info.className = 'hint err'; }
+    }
+    document.getElementById('btn-class-atualizar').addEventListener('click', carregarGaleriaClassificacao);
 
     document.getElementById('btn-testar-imagem').addEventListener('click', async () => {
       const sel = document.getElementById('test-sel-modelo').value;
@@ -4029,7 +4580,7 @@ PAGE_HTML = """
           const resImg = document.getElementById('test-img-resultado');
           resImg.src = `data:image/jpeg;base64,${data.imagem}`;
           resImg.style.display = 'block';
-          resultEl.textContent = data.deteccoes.length ? `${data.deteccoes.length} deteccao(oes) encontrada(s).` : 'Nenhuma deteccao encontrada.';
+          resultEl.textContent = data.classificacao ? `Resultado: ${data.classificacao.nome} (${(data.classificacao.confianca * 100).toFixed(1)}%).` : (data.deteccoes.length ? `${data.deteccoes.length} deteccao(oes) encontrada(s).` : 'Nenhuma deteccao encontrada.');
           resultEl.className = 'hint ok';
           document.getElementById('test-deteccoes-lista').innerHTML = data.deteccoes.map((d) => `
             <span class="chip-select" style="--chip-color:${d.cor}">${d.classe} (${Math.round(d.confianca * 100)}%)</span>
@@ -4141,7 +4692,7 @@ PAGE_HTML = """
           <div class="modelo-card" data-nome="${m.nome}">
             <div class="modelo-card-header">
               <strong>${m.nome}</strong>
-              <span class="modelo-badge ${m.task}">${m.task === 'segment' ? 'Segmentacao' : 'Deteccao'}</span>
+              <span class="modelo-badge ${m.task}">${m.task === 'classify' ? 'Classificacao' : (m.task === 'segment' ? 'Segmentacao' : 'Deteccao')}</span>
             </div>
             <div class="modelo-stats-mini">
               <div class="modelo-stat-mini"><strong>${m.total_treino}</strong><span>Treino</span></div>
@@ -4252,14 +4803,12 @@ PAGE_HTML = """
     async function carregarDetalheModelo() {
       document.getElementById('detalhe-nome-projeto').textContent = projetoAtual;
       const badge = document.getElementById('detalhe-badge-task');
-      badge.textContent = projetoTask === 'segment' ? 'Segmentacao' : 'Deteccao';
+      badge.textContent = projetoTask === 'classify' ? 'Classificacao' : (projetoTask === 'segment' ? 'Segmentacao' : 'Deteccao');
       badge.className = `modelo-badge ${projetoTask}`;
 
-      const pendentes = (ultimosDadosImagens.pendentes || []).length;
-      const treino = (ultimosDadosImagens.treino || []).length;
-      const validacao = (ultimosDadosImagens.validacao || []).length;
+      const { pendentes, treino, validacao } = contagensImagens;
       const campos = [
-        ['Tipo', projetoTask === 'segment' ? 'Segmentacao' : 'Deteccao'],
+        ['Tipo', projetoTask === 'classify' ? 'Classificacao' : (projetoTask === 'segment' ? 'Segmentacao' : 'Deteccao')],
         ['Classes', state.classes.length],
         ['Pendentes', pendentes],
         ['Treino', treino],
@@ -4431,6 +4980,8 @@ PAGE_HTML = """
 
 def create_app(camera_manager: CameraManager, titulo: str) -> Flask:
     app = Flask(__name__)
+    lotes_em_analise = {}
+    lotes_lock = threading.Lock()
 
     @app.get('/')
     def index():
@@ -4706,6 +5257,108 @@ def create_app(camera_manager: CameraManager, titulo: str) -> Flask:
         return jsonify({'ok': True, 'importadas': importadas, 'ja_existiam': ja_existiam,
                         'sem_marcacao': sem_marcacao, 'classes_adicionadas': adicionadas})
 
+    @app.post('/classificacao/importar')
+    def importar_dataset_classificacao():
+        """Importa ZIP com train/valid/test/<classe>/imagens, inclusive se
+        essas pastas estiverem dentro de uma pasta raiz no arquivo compactado."""
+        pp = get_project(request.form.get('projeto', ''))
+        if load_project_task(pp) != 'classify':
+            return jsonify({'ok': False, 'erro': 'Este modelo nao e de classificacao.'}), 400
+        arquivo = request.files.get('arquivo')
+        if not arquivo or not arquivo.filename:
+            return jsonify({'ok': False, 'erro': 'Selecione um arquivo .zip.'}), 400
+        try:
+            z = zipfile.ZipFile(arquivo.stream)
+        except zipfile.BadZipFile:
+            return jsonify({'ok': False, 'erro': 'O arquivo nao e um .zip valido.'}), 400
+        splits = {'train', 'valid', 'val', 'test'}
+        total, ignoradas, classes = 0, 0, set()
+        with z:
+            for info in z.infolist():
+                if info.is_dir() or info.file_size > 50 * 1024 * 1024:
+                    continue
+                partes = [safe_name(p) for p in info.filename.replace('\\', '/').split('/') if p and p not in ('.', '..')]
+                pos = next((i for i, p in enumerate(partes) if p.lower() in splits), None)
+                if pos is None or len(partes) < pos + 3:
+                    continue
+                split, classe, nome = partes[pos].lower(), slugify_projeto(partes[pos + 1]), safe_name(partes[-1])
+                if split == 'val': split = 'valid'
+                if not classe or Path(nome).suffix.lower() not in ('.jpg', '.jpeg', '.png'):
+                    ignoradas += 1
+                    continue
+                destino = pp.classify_dataset / split / classe
+                destino.mkdir(parents=True, exist_ok=True)
+                base, ext = Path(nome).stem, Path(nome).suffix.lower()
+                alvo = destino / nome
+                n = 1
+                while alvo.exists():
+                    alvo = destino / f'{base}_{n}{ext}'
+                    n += 1
+                alvo.write_bytes(z.read(info))
+                classes.add(classe)
+                total += 1
+        classes_train = sorted(d.name for d in (pp.classify_dataset / 'train').iterdir() if d.is_dir())
+        save_classes(pp, classes_train)
+        if not total:
+            return jsonify({'ok': False, 'erro': 'Nenhuma imagem encontrada. Use train/valid/test/nome_da_classe/imagem.jpg.'}), 400
+        return jsonify({'ok': True, 'importadas': total, 'classes': classes_train, 'ignoradas': ignoradas})
+
+    @app.post('/classificacao/imagens')
+    def adicionar_imagens_classificacao():
+        pp = get_project(request.form.get('projeto', ''))
+        classe = slugify_projeto(request.form.get('classe', ''))
+        split = request.form.get('split', 'train')
+        if load_project_task(pp) != 'classify' or not classe or split not in ('train', 'valid', 'test'):
+            return jsonify({'ok': False, 'erro': 'Informe uma classe e uma divisão válidas.'}), 400
+        destino = pp.classify_dataset / split / classe
+        destino.mkdir(parents=True, exist_ok=True)
+        salvas = 0
+        for arquivo in request.files.getlist('arquivos'):
+            if not arquivo or Path(arquivo.filename).suffix.lower() not in ('.jpg', '.jpeg', '.png'):
+                continue
+            ext = Path(arquivo.filename).suffix.lower()
+            nome = f'foto_{datetime.now().strftime("%Y%m%d_%H%M%S_%f")}_{salvas}{ext}'
+            arquivo.save(str(destino / nome))
+            salvas += 1
+        classes_train = sorted(d.name for d in (pp.classify_dataset / 'train').iterdir() if d.is_dir())
+        save_classes(pp, classes_train)
+        if not salvas:
+            return jsonify({'ok': False, 'erro': 'Nenhuma imagem válida foi enviada.'}), 400
+        return jsonify({'ok': True, 'salvas': salvas, 'classes': classes_train})
+
+    @app.get('/classificacao/imagens')
+    def listar_imagens_classificacao():
+        pp = get_project(request.args.get('projeto', ''))
+        if load_project_task(pp) != 'classify':
+            return jsonify({'ok': False, 'erro': 'Este modelo nao e de classificacao.'}), 400
+        imagens, contagens = [], {'train': 0, 'valid': 0, 'test': 0}
+        for split in contagens:
+            raiz = pp.classify_dataset / split
+            for classe_dir in raiz.iterdir():
+                if not classe_dir.is_dir():
+                    continue
+                for ext in IMAGE_EXTENSIONS:
+                    for arq in classe_dir.glob(ext):
+                        contagens[split] += 1
+                        imagens.append({'split': split, 'classe': classe_dir.name, 'nome': arq.name, '_mtime': arq.stat().st_mtime})
+        imagens.sort(key=lambda item: item['_mtime'], reverse=True)
+        for item in imagens:
+            del item['_mtime']
+        return jsonify({'ok': True, 'imagens': imagens[:72], 'total': sum(contagens.values()), 'contagens': contagens})
+
+    @app.get('/classificacao/imagem')
+    def imagem_classificacao():
+        pp = get_project(request.args.get('projeto', ''))
+        split = request.args.get('split', '')
+        classe = slugify_projeto(request.args.get('classe', ''))
+        nome = safe_name(request.args.get('nome', ''))
+        if load_project_task(pp) != 'classify' or split not in ('train', 'valid', 'test'):
+            abort(404)
+        imagem = pp.classify_dataset / split / classe / nome
+        if not imagem.is_file() or imagem.suffix.lower() not in ('.jpg', '.jpeg', '.png'):
+            abort(404)
+        return send_file(imagem, max_age=0)
+
     def _classes_no_label(lbl_path: Path) -> list:
         """Le so a 1a coluna (indice da classe) de cada linha do .txt de anotacao
         (formato YOLO, vale tanto pra caixa quanto pra poligono de segmentacao,
@@ -4725,33 +5378,72 @@ def create_app(camera_manager: CameraManager, titulo: str) -> Flask:
                 continue
         return sorted(indices)
 
-    def _listar(pasta_dir: Path, label_dir=None, pre_anotacao=False):
-        itens = []
+    def _arquivos_imagem(pasta_dir: Path):
         arquivos = []
         for ext in IMAGE_EXTENSIONS:
             arquivos.extend(pasta_dir.glob(ext))
-        for p in sorted(arquivos, key=lambda f: f.stat().st_mtime, reverse=True):
+        return sorted(arquivos, key=lambda f: f.stat().st_mtime, reverse=True)
+
+    def _contar_imagens(pasta_dir: Path) -> int:
+        return sum(1 for ext in IMAGE_EXTENSIONS for _ in pasta_dir.glob(ext))
+
+    def _listar(pasta_dir: Path, label_dir=None, pre_anotacao=False, classes=None,
+                pagina=1, por_pagina=36):
+        arquivos = _arquivos_imagem(pasta_dir)
+        # Com filtro, precisamos verificar os labels para saber a contagem correta;
+        # sem filtro, apenas os arquivos da pagina atual sao processados abaixo.
+        if classes:
+            arquivos = [p for p in arquivos if set(_classes_no_label(label_dir / (p.stem + '.txt'))).intersection(classes)]
+        total = len(arquivos)
+        total_paginas = max(1, (total + por_pagina - 1) // por_pagina)
+        pagina = min(pagina, total_paginas)
+        inicio = (pagina - 1) * por_pagina
+        itens = []
+        for p in arquivos[inicio:inicio + por_pagina]:
+            lbl = label_dir / (p.stem + '.txt') if label_dir is not None else None
+            classes_imagem = _classes_no_label(lbl) if lbl is not None else []
             info = {'nome': p.name}
             if label_dir is not None:
-                lbl = label_dir / (p.stem + '.txt')
                 if pre_anotacao:
                     # pendentes: so marca as que vieram com marcacao previa (ex.: da IA)
                     if lbl.exists():
                         info['pre_anotado'] = True
-                        info['classes'] = _classes_no_label(lbl)
+                        info['classes'] = classes_imagem
                 else:
                     info['anotado'] = lbl.exists() and lbl.stat().st_size > 0
-                    info['classes'] = _classes_no_label(lbl)
+                    info['classes'] = classes_imagem
             itens.append(info)
-        return itens
+        return itens, total, pagina, total_paginas
 
     @app.get('/imagens')
     def listar_imagens():
         pp = get_project(request.args.get('projeto', ''))
+        pasta = request.args.get('pasta', 'pendentes')
+        fontes = {
+            'pendentes': (pp.capturas, pp.capturas_labels, True),
+            'treino': (pp.images_train, pp.labels_train, False),
+            'validacao': (pp.images_val, pp.labels_val, False),
+        }
+        if pasta not in fontes:
+            return jsonify({'ok': False, 'erro': 'Pasta de imagens invalida.'}), 400
+        try:
+            pagina = max(1, int(request.args.get('pagina', 1)))
+            por_pagina = min(100, max(1, int(request.args.get('por_pagina', 36))))
+            classes = {int(i) for i in request.args.get('classes', '').split(',') if i.strip()}
+        except ValueError:
+            return jsonify({'ok': False, 'erro': 'Parametros de paginacao invalidos.'}), 400
+
+        diretorio, labels, pre_anotacao = fontes[pasta]
+        itens, total, pagina, total_paginas = _listar(
+            diretorio, labels, pre_anotacao, classes, pagina, por_pagina)
         return jsonify({
-            'pendentes': _listar(pp.capturas, pp.capturas_labels, pre_anotacao=True),
-            'treino': _listar(pp.images_train, pp.labels_train),
-            'validacao': _listar(pp.images_val, pp.labels_val),
+            'itens': itens,
+            'paginacao': {'pagina': pagina, 'por_pagina': por_pagina, 'total': total, 'total_paginas': total_paginas},
+            'contagens': {
+                'pendentes': _contar_imagens(pp.capturas),
+                'treino': _contar_imagens(pp.images_train),
+                'validacao': _contar_imagens(pp.images_val),
+            },
             'task': load_project_task(pp),
         })
 
@@ -4850,6 +5542,67 @@ def create_app(camera_manager: CameraManager, titulo: str) -> Flask:
 
         pontos_norm = [[px / w, py / h] for px, py in pontos]
         return jsonify({'ok': True, 'pontos': pontos_norm})
+
+    @app.post('/anotar/auto_deteccao')
+    def anotar_auto_deteccao():
+        """Modo 'auto deteccao': roda um modelo ja treinado (de qualquer
+        projeto) na imagem e devolve todas as marcacoes encontradas, ja no
+        formato do projeto atual (caixa ou poligono). Classes que o modelo
+        conhece mas o projeto ainda nao tem sao cadastradas automaticamente
+        (mesma regra da analise em lote). Nada e salvo no .txt aqui -- o
+        usuario revisa e salva pelo botao 'Salvar anotacao'."""
+        data = request.get_json(silent=True) or {}
+        pp = get_project(data.get('projeto', ''))
+        path = _resolve_image_path(pp, data.get('pasta', ''), safe_name(data.get('nome', '')))
+        if path is None or not path.exists() or not path.is_file():
+            return jsonify({'ok': False, 'erro': 'Imagem nao encontrada.'}), 404
+
+        pp_modelo = get_project(data.get('projeto_modelo', ''))
+        run = safe_name(data.get('run', ''))
+        best = pp_modelo.runs / run / 'weights' / 'best.pt'
+        if not run or not best.exists():
+            return jsonify({'ok': False, 'erro': 'Modelo nao encontrado.'}), 404
+        try:
+            conf = float(data.get('conf', 0.4))
+        except (TypeError, ValueError):
+            conf = 0.4
+        conf = min(max(conf, 0.05), 0.95)
+
+        img = cv2.imread(str(path))
+        if img is None:
+            return jsonify({'ok': False, 'erro': 'Falha ao ler a imagem.'}), 500
+        try:
+            modelo = carregar_modelo_cache(best)
+            resultado = modelo.predict(img, conf=conf, verbose=False)[0]
+        except Exception as exc:
+            return jsonify({'ok': False, 'erro': f'Falha ao rodar o modelo: {exc}'}), 500
+
+        classes = load_classes(pp)
+        conhecidas = {_normalizar_classe(c) for c in classes}
+        classes_novas = []
+        for box in resultado.boxes:
+            nome_cls = str(resultado.names.get(int(box.cls[0]), int(box.cls[0])))
+            chave = _normalizar_classe(nome_cls)
+            if chave not in conhecidas:
+                conhecidas.add(chave)
+                classes_novas.append(nome_cls)
+        if classes_novas:
+            classes.extend(classes_novas)
+            save_classes(pp, classes)
+        mapa_classes = {_normalizar_classe(nome_cls): i for i, nome_cls in enumerate(classes)}
+        task = load_project_task(pp)
+
+        caixas = []
+        for linha in linhas_yolo_do_resultado(resultado, task, mapa_classes, img.shape[0], img.shape[1]):
+            partes = linha.split()
+            cls_id = int(partes[0])
+            valores = [float(v) for v in partes[1:]]
+            if task == 'segment':
+                caixas.append({'classe': cls_id, 'pontos': [[valores[i], valores[i + 1]] for i in range(0, len(valores), 2)]})
+            else:
+                xc, yc, bw, bh = valores
+                caixas.append({'classe': cls_id, 'x': xc - bw / 2, 'y': yc - bh / 2, 'w': bw, 'h': bh})
+        return jsonify({'ok': True, 'caixas': caixas, 'classes_novas': classes_novas})
 
     @app.post('/anotar')
     def anotar():
@@ -5125,6 +5878,139 @@ def create_app(camera_manager: CameraManager, titulo: str) -> Flask:
         shutil.copy2(best, destino)
         return jsonify({'ok': True, 'destino': str(destino)})
 
+    @app.post('/lote/analisar')
+    def analisar_lote():
+        pp_destino = get_project(request.form.get('projeto_destino', ''))
+        pp_modelo = get_project(request.form.get('projeto_modelo', ''))
+        run = safe_name(request.form.get('run', ''))
+        best = pp_modelo.runs / run / 'weights' / 'best.pt'
+        if not best.exists():
+            return jsonify({'ok': False, 'erro': 'Modelo nao encontrado.'}), 404
+        try:
+            conf = float(request.form.get('conf', 0.4))
+        except (TypeError, ValueError):
+            conf = 0.4
+        conf = min(max(conf, 0.05), 0.95)
+
+        entradas = []
+        for arquivo in request.files.getlist('arquivos'):
+            if not arquivo or not arquivo.filename:
+                continue
+            ext = Path(arquivo.filename).suffix.lower()
+            if ext not in ('.jpg', '.jpeg', '.png'):
+                continue
+            dados = arquivo.read()
+            frame = cv2.imdecode(np.frombuffer(dados, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame is not None:
+                entradas.append((arquivo.filename, ext, dados, frame))
+        if not entradas:
+            return jsonify({'ok': False, 'erro': 'Nenhuma imagem valida enviada (use .jpg/.jpeg/.png).'}), 400
+
+        try:
+            modelo = carregar_modelo_cache(best)
+            resultados = []
+            # Processa em pequenos lotes: aproveita a inferencia em grupo sem ocupar
+            # memoria demais quando muitas fotos de alta resolucao forem selecionadas.
+            for inicio in range(0, len(entradas), 16):
+                resultados.extend(modelo.predict([e[3] for e in entradas[inicio:inicio + 16]], conf=conf, verbose=False))
+        except Exception as exc:
+            return jsonify({'ok': False, 'erro': f'Falha ao rodar o modelo: {exc}'}), 500
+
+        classes = load_classes(pp_destino)
+        nomes_detectados = []
+        for resultado in resultados:
+            for box in resultado.boxes:
+                nome = str(resultado.names.get(int(box.cls[0]), int(box.cls[0])))
+                if _normalizar_classe(nome) not in {_normalizar_classe(c) for c in classes + nomes_detectados}:
+                    nomes_detectados.append(nome)
+        if nomes_detectados:
+            classes.extend(nomes_detectados)
+            save_classes(pp_destino, classes)
+        mapa_classes = {_normalizar_classe(nome): i for i, nome in enumerate(classes)}
+        task = load_project_task(pp_destino)
+
+        lote = uuid.uuid4().hex
+        pasta_lote = pp_destino.dataset / '_lotes_temporarios' / lote
+        imagens_lote = pasta_lote / 'images'
+        labels_lote = pasta_lote / 'labels'
+        previews_lote = pasta_lote / 'previews'
+        imagens_lote.mkdir(parents=True, exist_ok=True)
+        labels_lote.mkdir(parents=True, exist_ok=True)
+        previews_lote.mkdir(parents=True, exist_ok=True)
+        itens = []
+        try:
+            for i, ((nome_original, ext, dados, frame), resultado) in enumerate(zip(entradas, resultados)):
+                nome = f'lote_{datetime.now().strftime("%Y%m%d_%H%M%S_%f")}_{i}{ext}'
+                linhas = linhas_yolo_do_resultado(resultado, task, mapa_classes, frame.shape[0], frame.shape[1])
+                (imagens_lote / nome).write_bytes(dados)
+                (labels_lote / f'{Path(nome).stem}.txt').write_text('\n'.join(linhas) + ('\n' if linhas else ''), encoding='utf-8')
+                preview = frame.copy()
+                desenhar_deteccoes(preview, resultado)
+                if not cv2.imwrite(str(previews_lote / f'{Path(nome).stem}.jpg'), preview, [int(cv2.IMWRITE_JPEG_QUALITY), 82]):
+                    raise RuntimeError('Nao foi possivel gerar a visualizacao das marcacoes.')
+                itens.append({'nome': safe_name(nome_original), 'arquivo': nome, 'deteccoes': len(linhas)})
+        except Exception as exc:
+            shutil.rmtree(pasta_lote, ignore_errors=True)
+            return jsonify({'ok': False, 'erro': f'Falha ao preparar o lote: {exc}'}), 500
+        with lotes_lock:
+            lotes_em_analise[lote] = {'projeto': pp_destino.nome, 'pasta': pasta_lote, 'criado_em': time.time()}
+        return jsonify({'ok': True, 'lote': lote, 'itens': itens, 'classes_adicionadas': nomes_detectados})
+
+    @app.get('/lote/preview/<lote>/<nome>')
+    def preview_lote(lote, nome):
+        with lotes_lock:
+            dados_lote = lotes_em_analise.get(str(lote))
+        if not dados_lote:
+            abort(404)
+        imagem = dados_lote['pasta'] / 'previews' / f'{Path(safe_name(nome)).stem}.jpg'
+        if not imagem.exists() or not imagem.is_file():
+            abort(404)
+        return send_file(imagem, mimetype='image/jpeg', max_age=0)
+
+    @app.post('/lote/salvar')
+    def salvar_lote():
+        data = request.get_json(silent=True) or {}
+        lote = str(data.get('lote', ''))
+        destino = data.get('destino', '')
+        destinos = {
+            'pendentes': ('capturas', 'capturas_labels'),
+            'treino': ('images_train', 'labels_train'),
+            'validacao': ('images_val', 'labels_val'),
+        }
+        if destino not in destinos:
+            return jsonify({'ok': False, 'erro': 'Destino invalido.'}), 400
+        with lotes_lock:
+            dados_lote = lotes_em_analise.pop(lote, None)
+        if not dados_lote:
+            return jsonify({'ok': False, 'erro': 'Lote nao encontrado ou ja finalizado.'}), 404
+        pp = get_project(dados_lote['projeto'])
+        origem = dados_lote['pasta']
+        imagens_destino = getattr(pp, destinos[destino][0])
+        labels_destino = getattr(pp, destinos[destino][1])
+        salvos = 0
+        try:
+            for imagem in (origem / 'images').iterdir():
+                if not imagem.is_file():
+                    continue
+                shutil.move(str(imagem), str(imagens_destino / imagem.name))
+                label = origem / 'labels' / f'{imagem.stem}.txt'
+                if label.exists():
+                    shutil.move(str(label), str(labels_destino / label.name))
+                salvos += 1
+        finally:
+            shutil.rmtree(origem, ignore_errors=True)
+        return jsonify({'ok': True, 'salvos': salvos, 'destino': destino})
+
+    @app.post('/lote/descartar')
+    def descartar_lote():
+        data = request.get_json(silent=True) or {}
+        lote = str(data.get('lote', ''))
+        with lotes_lock:
+            dados_lote = lotes_em_analise.pop(lote, None)
+        if dados_lote:
+            shutil.rmtree(dados_lote['pasta'], ignore_errors=True)
+        return jsonify({'ok': True})
+
     @app.get('/testador/modelos')
     def testador_modelos():
         resultado = []
@@ -5174,6 +6060,18 @@ def create_app(camera_manager: CameraManager, titulo: str) -> Flask:
             resultado = modelo.predict(frame, conf=conf, verbose=False)[0]
         except Exception as exc:
             return jsonify({'ok': False, 'erro': f'Falha ao rodar o modelo: {exc}'}), 500
+        if load_project_task(pp) == 'classify':
+            probs = resultado.probs
+            if probs is None:
+                return jsonify({'ok': False, 'erro': 'O modelo nao retornou probabilidades de classificacao.'}), 500
+            indice = int(probs.top1)
+            confianca = float(probs.top1conf)
+            nome = str(resultado.names.get(indice, indice))
+            ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            if not ok:
+                return jsonify({'ok': False, 'erro': 'Falha ao codificar imagem de resultado.'}), 500
+            return jsonify({'ok': True, 'imagem': base64.b64encode(buf.tobytes()).decode('ascii'),
+                            'deteccoes': [], 'classificacao': {'nome': nome, 'confianca': confianca}})
         deteccoes = desenhar_deteccoes(frame, resultado)
 
         ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
